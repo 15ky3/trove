@@ -414,6 +414,14 @@
   const updateKey = (repo) => `${repo.repo_type}:${repo.repo_id}`;
   const updateFor = (repo) => state.updates[updateKey(repo)];
 
+  // Whole copies moved to a new commit; partial ones report the files that
+  // changed, because their commit says nothing about the selection.
+  function updateSummary(update) {
+    if (!update.partial) return `→ @${shortSha(update.remote_commit)}`;
+    const n = update.changed_files.length;
+    return `${fmtNum(n)} of ${fmtNum(update.tracked_files)} ${n === 1 ? "file" : "files"} changed`;
+  }
+
   // One Hub request per repo, so this is deliberately a button rather than
   // something that runs on every library load.
   async function checkUpdates() {
@@ -477,7 +485,7 @@
         <div class="tape-meta">
           <span>${fmtNum(repo.files)} files</span>
           ${repo.commit ? `<span>@${esc(shortSha(repo.commit))}</span>` : ""}
-          ${update?.outdated ? `<span class="is-accent">→ @${esc(shortSha(update.remote_commit))}</span>` : ""}
+          ${update?.outdated ? `<span class="is-accent">${esc(updateSummary(update))}</span>` : ""}
           <span>${fmtRel(repo.downloaded_at)}</span>
           <span class="path">${esc(repo.path)}</span>
         </div>
@@ -916,9 +924,13 @@
       <div class="sheet-section">
         <h3>Path</h3>
         <p class="mono hint">${esc(data.path)}</p>
-        ${repo?.partial ? `<p class="hint">Partial copy — refreshing keeps the same selection, and it is left out of update checks.</p>` : ""}
-        ${update?.outdated ? `<p class="hint is-accent">The Hub is at @${esc(shortSha(update.remote_commit))} — updating replaces this copy.</p>` : ""}
+        ${repo?.partial ? `<p class="hint">Partial copy — updating fetches the same selection again, never the whole repo.</p>` : ""}
+        ${update?.outdated && update.partial ? `
+          <p class="hint is-accent">Changed on the Hub since you downloaded them:</p>
+          <p class="mono hint">${update.changed_files.map(esc).join("<br>")}</p>` : ""}
+        ${update?.outdated && !update.partial ? `<p class="hint is-accent">The Hub is at @${esc(shortSha(update.remote_commit))} — updating replaces this copy.</p>` : ""}
         ${update && !update.outdated && !update.skipped && !update.error ? `<p class="hint is-ok">Up to date as of the last check.</p>` : ""}
+        ${update?.skipped ? `<p class="hint">${esc(update.skipped)}</p>` : ""}
         ${update?.error ? `<p class="hint is-err">${esc(update.error)}</p>` : ""}
       </div>
       <div class="sheet-section">
@@ -928,7 +940,9 @@
 
     $("#sheet-foot").innerHTML = `
       <button class="btn ${update?.outdated ? "btn-accent" : ""}" id="sheet-update">${
-        update?.outdated ? `Update to @${esc(shortSha(update.remote_commit))}` : "Refresh from Hub"
+        update?.outdated
+          ? (update.partial ? `Update ${fmtNum(update.changed_files.length)} changed` : `Update to @${esc(shortSha(update.remote_commit))}`)
+          : "Refresh from Hub"
       }</button>
       <button class="btn" id="sheet-upload">Upload</button>
       <span class="spacer"></span>

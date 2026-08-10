@@ -43,7 +43,7 @@ def whoami(token: str | None = None) -> dict[str, Any]:
         info = api(token).whoami()
     except HfHubHTTPError as exc:
         raise HubError(f"Token rejected, or the Hub is unreachable: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 - Netzwerkfehler jeder Art
+    except Exception as exc:  # noqa: BLE001 - any kind of network failure
         raise HubError(str(exc)) from exc
 
     orgs = [o.get("name") for o in info.get("orgs", []) if isinstance(o, dict)]
@@ -84,16 +84,20 @@ def search(query: str, repo_type: str = "model", limit: int = 30) -> list[dict[s
     ]
 
 
-def resolve(repo_id: str, repo_type: str = "model", revision: str | None = None) -> dict[str, Any]:
-    """Check that a repo exists and return its canonical id.
-
-    Legacy short names such as `bert-base-uncased` redirect to
-    `google-bert/...`. The Hub follows that redirect but the Xet token endpoint
-    does not, so a download started under the short name dies partway through
-    with a 404. Resolving at queue time avoids it.
-    """
+def _fetch_info(
+    repo_id: str,
+    repo_type: str,
+    revision: str | None,
+    files_metadata: bool = False,
+) -> Any:
+    """repo_info with the Hub's errors turned into readable ones."""
     try:
-        info = api().repo_info(repo_id=repo_id, repo_type=repo_type, revision=revision or None)
+        return api().repo_info(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            revision=revision or None,
+            files_metadata=files_metadata,
+        )
     except GatedRepoError as exc:
         raise HubError(
             "This repo is gated. Request access on huggingface.co and store a token in Settings."
@@ -105,7 +109,32 @@ def resolve(repo_id: str, repo_type: str = "model", revision: str | None = None)
     except Exception as exc:  # noqa: BLE001
         raise HubError(str(exc)) from exc
 
+
+def resolve(repo_id: str, repo_type: str = "model", revision: str | None = None) -> dict[str, Any]:
+    """Check that a repo exists and return its canonical id.
+
+    Legacy short names such as `bert-base-uncased` redirect to
+    `google-bert/...`. The Hub follows that redirect but the Xet token endpoint
+    does not, so a download started under the short name dies partway through
+    with a 404. Resolving at queue time avoids it.
+    """
+    info = _fetch_info(repo_id, repo_type, revision)
     return {"repo_id": info.id or repo_id, "sha": info.sha or ""}
+
+
+def file_state(repo_id: str, repo_type: str = "model", revision: str | None = None) -> dict[str, Any]:
+    """The commit plus one content hash per file.
+
+    The hash is the git blob id for plain files and the LFS sha256 for large
+    ones — which is exactly what huggingface_hub writes into its per-file
+    `.metadata` when downloading, so local and remote compare directly.
+    """
+    info = _fetch_info(repo_id, repo_type, revision, files_metadata=True)
+    files = {}
+    for sibling in info.siblings or []:
+        lfs = getattr(sibling, "lfs", None)
+        files[sibling.rfilename] = (getattr(lfs, "sha256", "") if lfs else "") or sibling.blob_id or ""
+    return {"repo_id": info.id or repo_id, "sha": info.sha or "", "files": files}
 
 
 def repo_info(repo_id: str, repo_type: str = "model", revision: str | None = None) -> dict[str, Any]:

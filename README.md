@@ -82,9 +82,9 @@ delete what you no longer need.
 <tr><td>
 
 **See what moved upstream**
-One click compares every repo against the Hub and marks the ones whose commit
-changed. Update a single repo or all of them at once. Copies where you picked
-individual files stay out of it.
+One click compares every repo against the Hub and marks what changed. Update a
+single repo or all of them at once. Copies where you picked individual files are
+compared file by file, so you only hear about the ones you actually took.
 
 </td><td>
 
@@ -259,19 +259,24 @@ interrupted transfers are re-queued and continue.
 
 ### Keeping copies current
 
-Every download records the commit it came from. **Check for updates** in the
-library asks the Hub for each repo's current commit and compares the two, so you
-find out what has moved without downloading anything. Repos that changed are
-marked, and you can queue them one at a time or all at once with **Update all**.
+**Check for updates** in the library compares what you have against the Hub
+without downloading anything. What changed is marked, and you can queue it one
+repo at a time or all at once with **Update all**. Updating re-fetches exactly
+what was fetched before, so a partial copy stays partial.
 
-Copies where you picked individual files are left out of the check on purpose. A
-differing commit says nothing about the handful of files you actually took — the
-change may well be in a file you never wanted. Those keep the **Refresh from
-Hub** button, which fetches the same selection again.
+Whole copies are compared by commit: every download records the one it came
+from, and a differing commit means the repo moved.
 
-Repos without a download record are skipped too: without a commit there is
-nothing to compare. That applies to folders written by something other than
-Trove, and to copies from before this feature existed.
+Copies where you picked individual files need more care, because their commit
+changes whenever *anything* in the repo does — usually something the selection
+never included. Those are compared file by file instead. `huggingface_hub`
+records a content hash for every file it writes (the git blob id, or the LFS
+sha256 for large ones), and the Hub reports the same values, so the check can
+say `2 of 5 files changed` and name them. Files you never took are ignored.
+
+Repos with no download record are skipped: there is nothing to compare against.
+That covers folders written by something other than Trove, and copies made
+before this existed.
 
 ### Picking individual files
 

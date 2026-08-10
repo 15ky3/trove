@@ -165,6 +165,30 @@ def repo_files(repo_type: str, repo_id: str, limit: int = 2000) -> list[dict[str
     return out
 
 
+def local_etags(repo_type: str, repo_id: str) -> dict[str, str]:
+    """The content hash huggingface_hub recorded for each downloaded file.
+
+    It keeps a `<file>.metadata` next to its download cache holding three lines:
+    the commit, the etag, and a timestamp. The etag is the git blob id for plain
+    files and the LFS sha256 for large ones — the same values the Hub reports,
+    so comparing them says exactly which files moved.
+    """
+    root = local_dir_for(repo_type, repo_id) / ".cache" / "huggingface" / "download"
+    out: dict[str, str] = {}
+    if not root.is_dir():
+        return out
+    for path in root.rglob("*.metadata"):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        if len(lines) < 2 or not lines[1].strip():
+            continue
+        name = path.relative_to(root).as_posix().removesuffix(".metadata")
+        out[name] = lines[1].strip()
+    return out
+
+
 def delete_repo(repo_type: str, repo_id: str) -> dict[str, Any]:
     path = local_dir_for(repo_type, repo_id)
     if not path.is_dir():

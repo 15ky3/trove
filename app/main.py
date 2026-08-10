@@ -306,17 +306,40 @@ async def _check_updates() -> list[dict[str, Any]]:
             "repo_id": repo["repo_id"],
             "repo_type": repo["repo_type"],
             "revision": repo["revision"],
+            "partial": repo["partial"],
             "commit": repo["commit"],
             "remote_commit": "",
             "outdated": False,
+            "changed_files": [],
+            "tracked_files": 0,
             "skipped": "",
             "error": "",
         }
-        # A partial copy cannot be compared: its folder holds a hand-picked
-        # subset, so a differing commit says nothing about those files.
+
+        # A partial copy is compared file by file. Its commit always differs
+        # once anything in the repo moves, and that is usually something the
+        # selection never included.
         if repo["partial"]:
-            entry["skipped"] = "Only selected files were downloaded."
+            local = await asyncio.to_thread(storage.local_etags, repo["repo_type"], repo["repo_id"])
+            if not local:
+                entry["skipped"] = "No per-file record — this copy predates the update check."
+                return entry
+            async with limit:
+                try:
+                    remote = await asyncio.to_thread(
+                        hub.file_state, repo["repo_id"], repo["repo_type"], repo["revision"] or None
+                    )
+                except hub.HubError as exc:
+                    entry["error"] = str(exc)
+                    return entry
+            entry["remote_commit"] = remote["sha"]
+            entry["tracked_files"] = len(local)
+            entry["changed_files"] = sorted(
+                name for name, etag in local.items() if remote["files"].get(name) != etag
+            )
+            entry["outdated"] = bool(entry["changed_files"])
             return entry
+
         if not repo["commit"]:
             entry["skipped"] = "No download record — the commit is unknown."
             return entry
@@ -347,42 +370,47 @@ async def library_updates() -> dict[str, Any]:
 
 @app.post("/api/library/update", dependencies=[Depends(require_auth)])
 async def library_update(body: UpdateBody) -> dict[str, Any]:
+    library = await asyncio.to_thread(storage.list_repos, None, False)
+    by_key = {(r["repo_type"], r["repo_id"]): r for r in library}
+
     if body.all_outdated:
-        targets = [entry for entry in await _check_updates() if entry["outdated"]]
+        targets = [(e["repo_type"], e["repo_id"]) for e in await _check_updates() if e["outdated"]]
     else:
         if not valid_repo_id(body.repo_id):
             raise HTTPException(status_code=400, detail="Invalid repo ID")
         if body.repo_type not in REPO_TYPES:
             raise HTTPException(status_code=400, detail="Invalid repo type")
-        repos = await asyncio.to_thread(storage.list_repos, body.repo_type, False)
-        repo = next((r for r in repos if r["repo_id"] == body.repo_id), None)
-        if repo is None:
+        if (body.repo_type, body.repo_id) not in by_key:
             raise HTTPException(status_code=404, detail=f"{body.repo_id} is not in the library")
-        if repo["partial"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Only selected files were downloaded — use Refresh from Hub to fetch that same selection.",
-            )
-        targets = [dict(repo, remote_commit="")]
+        targets = [(body.repo_type, body.repo_id)]
 
     queued, skipped = [], []
-    for entry in targets:
+    for key in targets:
+        repo = by_key.get(key)
+        if repo is None:
+            continue
+        repo_type, repo_id = key
         active = any(
             job.kind == "download"
-            and job.repo_id == entry["repo_id"]
-            and job.repo_type == entry["repo_type"]
+            and job.repo_id == repo_id
+            and job.repo_type == repo_type
             and job.status in ACTIVE
             for job in manager.jobs.values()
         )
         if active:
-            skipped.append(entry["repo_id"])
+            skipped.append(repo_id)
             continue
+        # Re-fetch exactly what was fetched before: a partial copy must stay
+        # partial, or an update would quietly pull the whole repo.
         await manager.add_download(
-            repo_id=entry["repo_id"],
-            repo_type=entry["repo_type"],
-            revision=entry.get("revision") or "",
+            repo_id=repo_id,
+            repo_type=repo_type,
+            revision=repo["revision"] or "",
+            files=repo["files_selected"],
+            allow_patterns=repo["allow_patterns"],
+            ignore_patterns=repo["ignore_patterns"],
         )
-        queued.append(entry["repo_id"])
+        queued.append(repo_id)
 
     if not body.all_outdated and not queued:
         raise HTTPException(status_code=409, detail=f"{body.repo_id} is already queued")
