@@ -14,7 +14,6 @@
     libType: "",
     libFilter: "",
     updates: {},        // "type:repo_id" -> result of the last update check
-    updatesAt: 0,
     hubType: "model",
     hubResults: [],
     settings: {},
@@ -57,6 +56,7 @@
 
   const fmtNum = (n) => new Intl.NumberFormat("en-GB").format(Number(n) || 0);
   const shortSha = (sha) => String(sha || "").slice(0, 7);
+  const csv = (sel) => $(sel).value.split(",").map((s) => s.trim()).filter(Boolean);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -64,6 +64,10 @@
     const i = String(repoId).indexOf("/");
     return i < 0 ? { org: "", name: repoId } : { org: repoId.slice(0, i + 1), name: repoId.slice(i + 1) };
   }
+
+  const ACTIVE = ["queued", "running"];
+  const isActive = (job) => ACTIVE.includes(job.status);
+  const activeCount = () => state.jobs.filter(isActive).length;
 
   const TYPE_LABEL = { model: "Model", dataset: "Dataset", space: "Space" };
   const STATUS_LABEL = {
@@ -163,7 +167,7 @@
 
   function upsertJob(job) {
     const index = state.jobs.findIndex((j) => j.id === job.id);
-    const wasActive = index >= 0 && ["queued", "running"].includes(state.jobs[index].status);
+    const wasActive = index >= 0 && isActive(state.jobs[index]);
     if (index >= 0) state.jobs[index] = job; else state.jobs.push(job);
     // A finished download changes the library, so pull it again.
     if (wasActive && job.status === "done") { loadLibrary(); loadDisk(); }
@@ -257,7 +261,7 @@
         ? `${state.library.length} repos · ${fmtBytes(total)} in ${state.dataDir || "/data"}`
         : "Nothing downloaded yet";
     } else if (state.view === "queue") {
-      const active = state.jobs.filter((j) => ["queued", "running"].includes(j.status)).length;
+      const active = activeCount();
       sub.textContent = active ? `${active} active · ${state.jobs.length} total` : `${state.jobs.length} entries`;
     } else if (state.view === "hub") {
       sub.textContent = state.hubResults.length ? `${state.hubResults.length} results` : "Search the Hugging Face Hub";
@@ -269,7 +273,7 @@
   }
 
   function renderNavCounts() {
-    const active = state.jobs.filter((j) => ["queued", "running"].includes(j.status)).length;
+    const active = activeCount();
     const queue = $('[data-count="queue"]');
     queue.textContent = active || "";
     queue.classList.toggle("is-live", active > 0);
@@ -319,14 +323,14 @@
 
   function jobNumHTML(job) {
     const pct = Math.round(progressOf(job) * 100);
-    const head = ["running", "queued"].includes(job.status) ? `${pct} %` : STATUS_LABEL[job.status];
+    const head = isActive(job) ? `${pct} %` : STATUS_LABEL[job.status];
     const sub = job.total_files ? `${fmtNum(job.done_files)}/${fmtNum(job.total_files)} files` : "—";
     return `<b>${head}</b><span>${sub}</span>`;
   }
 
   function jobRowHTML(job) {
     const { org, name } = splitId(job.repo_id);
-    const actions = ["queued", "running"].includes(job.status)
+    const actions = isActive(job)
       ? `<button class="btn btn-sm btn-danger" data-act="cancel">Cancel</button>`
       : `<button class="btn btn-sm" data-act="retry">Try again</button>
          <button class="btn btn-sm btn-danger" data-act="forget" title="Remove from the list">Remove</button>`;
@@ -413,6 +417,8 @@
 
   const updateKey = (repo) => `${repo.repo_type}:${repo.repo_id}`;
   const updateFor = (repo) => state.updates[updateKey(repo)];
+  const findRepo = (repoId, repoType) =>
+    state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
 
   // Whole copies moved to a new commit; partial ones report the files that
   // changed, because their commit says nothing about the selection.
@@ -428,7 +434,6 @@
     const data = await api("/api/library/updates");
     state.updates = {};
     data.repos.forEach((entry) => { state.updates[updateKey(entry)] = entry; });
-    state.updatesAt = data.checked_at;
     renderLibrary();
 
     // Only repos that were actually compared belong in the count — skipped ones
@@ -446,7 +451,6 @@
     } else {
       toast(compared ? `All ${compared} checked are current.${tail}` : `Nothing to check.${tail}`, "ok");
     }
-    return data;
   }
 
   function renderLibrary() {
@@ -512,13 +516,9 @@
 
     if (action === "files") { openLocalSheet(repoId, repoType); return; }
     if (action === "update") { await runUpdate({ repo_id: repoId, repo_type: repoType }); return; }
-    if (action === "upload") {
-      const repo = state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
-      prefillUpload(repo);
-      return;
-    }
+    if (action === "upload") { prefillUpload(findRepo(repoId, repoType)); return; }
     if (action === "delete") {
-      const repo = state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
+      const repo = findRepo(repoId, repoType);
       if (!confirm(`Delete ${repoId}?\n\nThis frees ${repo ? fmtBytes(repo.size) : "the folder"} and cannot be undone.`)) return;
       try {
         const res = await api("/api/library/delete", { method: "POST", body: { repo_id: repoId, repo_type: repoType } });
@@ -890,20 +890,19 @@
     wirePicker();
 
     $("#sheet-download").addEventListener("click", () => {
-      const patterns = (id) => $(`#${id}`).value.split(",").map((s) => s.trim()).filter(Boolean);
       startDownload(repoId, repoType, {
         revision: $("#sheet-rev").value.trim(),
         files: selectedFiles(),
-        allow_patterns: patterns("sheet-allow"),
-        ignore_patterns: patterns("sheet-ignore"),
+        allow_patterns: csv("#sheet-allow"),
+        ignore_patterns: csv("#sheet-ignore"),
       });
     });
   }
 
   async function openLocalSheet(repoId, repoType) {
     state.sheet = { kind: "local", id: repoId };
-    const repo = state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
-    const update = state.updates[`${repoType}:${repoId}`];
+    const repo = findRepo(repoId, repoType);
+    const update = updateFor({ repo_id: repoId, repo_type: repoType });
     openSheet("Local", repoId, `<p class="hint">Reading the folder…</p>`, "");
     let data;
     try {
@@ -948,12 +947,11 @@
       <span class="spacer"></span>
       <button class="btn btn-danger" id="sheet-delete">Delete</button>`;
 
-    $("#sheet-update").addEventListener("click", () => startDownload(repoId, repoType, {
-      revision: repo?.revision || "",
-      files: repo?.files_selected || [],
-      allow_patterns: repo?.allow_patterns || [],
-      ignore_patterns: repo?.ignore_patterns || [],
-    }));
+    // Both labels do the same thing: re-fetch exactly what is recorded for
+    // this copy. The server reads that off the marker, so no selection travels
+    // back and forth.
+    $("#sheet-update").addEventListener("click", () =>
+      runUpdate({ repo_id: repoId, repo_type: repoType }));
     $("#sheet-upload").addEventListener("click", () => { prefillUpload(repo); closeSheet(); });
     $("#sheet-delete").addEventListener("click", async () => {
       if (!confirm(`Delete ${repoId}? This cannot be undone.`)) return;
@@ -1033,7 +1031,7 @@
       private: $("#up-private").checked,
       create_repo: $("#up-create").checked,
       commit_message: $("#up-msg").value.trim(),
-      ignore_patterns: $("#up-ignore").value.split(",").map((s) => s.trim()).filter(Boolean),
+      ignore_patterns: csv("#up-ignore"),
     };
     try {
       await api("/api/jobs/upload", { method: "POST", body });

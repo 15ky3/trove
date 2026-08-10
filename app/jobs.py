@@ -82,7 +82,6 @@ class JobManager:
         self._tasks: dict[str, asyncio.Task] = {}
         self._on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._lock = asyncio.Lock()
-        self._dirty = False
         self._progress_at: dict[str, float] = {}
         self._watchdog: asyncio.Task | None = None
 
@@ -208,7 +207,7 @@ class JobManager:
     async def _enqueue(self, job: Job) -> Job:
         self.jobs[job.id] = job
         self.order.append(job.id)
-        job.logs.append({"t": time.time(), "level": "info", "msg": "Added to the queue."})
+        self._log(job, "Added to the queue.")
         self._save()
         await self._push(job)
         await self._pump()
@@ -222,7 +221,7 @@ class JobManager:
         elif job.status == QUEUED:
             job.status = CANCELLED
             job.finished_at = time.time()
-            job.logs.append({"t": time.time(), "level": "warn", "msg": "Removed from the queue."})
+            self._log(job, "Removed from the queue.", "warn")
             self._save()
             await self._push(job)
         return job
@@ -238,7 +237,7 @@ class JobManager:
         job.done_files = 0
         job.started_at = 0.0
         job.finished_at = 0.0
-        job.logs.append({"t": time.time(), "level": "info", "msg": "Trying again."})
+        self._log(job, "Trying again.")
         self._save()
         await self._push(job)
         await self._pump()
@@ -262,6 +261,14 @@ class JobManager:
         self._save()
         await self._emit("jobs", jobs=self.snapshot())
         return len(removed)
+
+    async def reschedule(self) -> None:
+        """Start whatever the current concurrency limit now allows.
+
+        Called after the limit changes in Settings, so a raised value takes
+        effect on jobs that are already waiting.
+        """
+        await self._pump()
 
     def _require(self, job_id: str) -> Job:
         job = self.jobs.get(job_id)

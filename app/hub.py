@@ -138,23 +138,7 @@ def file_state(repo_id: str, repo_type: str = "model", revision: str | None = No
 
 
 def repo_info(repo_id: str, repo_type: str = "model", revision: str | None = None) -> dict[str, Any]:
-    try:
-        info = api().repo_info(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            revision=revision or None,
-            files_metadata=True,
-        )
-    except GatedRepoError as exc:
-        raise HubError(
-            "This repo is gated. Request access on huggingface.co and store a token with read access."
-        ) from exc
-    except RepositoryNotFoundError as exc:
-        raise HubError(f"Repo '{repo_id}' not found, or private and your token has no access.") from exc
-    except RevisionNotFoundError as exc:
-        raise HubError(f"Revision '{revision}' does not exist.") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HubError(str(exc)) from exc
+    info = _fetch_info(repo_id, repo_type, revision, files_metadata=True)
 
     files = []
     total = 0

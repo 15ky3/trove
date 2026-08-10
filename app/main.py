@@ -50,7 +50,7 @@ def _valid_session(token: str | None) -> bool:
         _serializer.loads(token, max_age=SESSION_MAX_AGE)
     except BadSignature:
         return False
-    except Exception:  # noqa: BLE001 - abgelaufene Signatur o.ae.
+    except Exception:  # noqa: BLE001 - expired signature and the like
         return False
     return True
 
@@ -212,7 +212,7 @@ async def put_settings(body: SettingsBody) -> dict[str, Any]:
     values = {k: v for k, v in body.model_dump().items() if v is not None}
     settings.update(values)
     # Apply a changed concurrency limit to waiting jobs right away.
-    await manager._pump()  # noqa: SLF001
+    await manager.reschedule()
     return settings.public()
 
 
@@ -296,6 +296,18 @@ async def library_files(
 UPDATE_CHECK_CONCURRENCY = 8
 
 
+def _download_active(repo_id: str, repo_type: str) -> bool:
+    """Is this repo already queued or running? Two downloads into the same
+    folder would fight over the same files."""
+    return any(
+        job.kind == "download"
+        and job.repo_id == repo_id
+        and job.repo_type == repo_type
+        and job.status in ACTIVE
+        for job in manager.jobs.values()
+    )
+
+
 async def _check_updates() -> list[dict[str, Any]]:
     """Compare the commit each repo was downloaded at against the Hub."""
     repos = await asyncio.to_thread(storage.list_repos, None, False)
@@ -370,8 +382,10 @@ async def library_updates() -> dict[str, Any]:
 
 @app.post("/api/library/update", dependencies=[Depends(require_auth)])
 async def library_update(body: UpdateBody) -> dict[str, Any]:
-    library = await asyncio.to_thread(storage.list_repos, None, False)
-    by_key = {(r["repo_type"], r["repo_id"]): r for r in library}
+    by_key = {
+        (r["repo_type"], r["repo_id"]): r
+        for r in await asyncio.to_thread(storage.list_repos, None, False)
+    }
 
     if body.all_outdated:
         targets = [(e["repo_type"], e["repo_id"]) for e in await _check_updates() if e["outdated"]]
@@ -390,14 +404,7 @@ async def library_update(body: UpdateBody) -> dict[str, Any]:
         if repo is None:
             continue
         repo_type, repo_id = key
-        active = any(
-            job.kind == "download"
-            and job.repo_id == repo_id
-            and job.repo_type == repo_type
-            and job.status in ACTIVE
-            for job in manager.jobs.values()
-        )
-        if active:
+        if _download_active(repo_id, repo_type):
             skipped.append(repo_id)
             continue
         # Re-fetch exactly what was fetched before: a partial copy must stay
@@ -456,18 +463,7 @@ async def create_download(body: DownloadBody) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     repo_id = resolved["repo_id"]
 
-    duplicate = next(
-        (
-            j
-            for j in manager.jobs.values()
-            if j.kind == "download"
-            and j.repo_id == repo_id
-            and j.repo_type == body.repo_type
-            and j.status in ACTIVE
-        ),
-        None,
-    )
-    if duplicate:
+    if _download_active(repo_id, body.repo_type):
         raise HTTPException(status_code=409, detail=f"{repo_id} is already queued")
 
     job = await manager.add_download(

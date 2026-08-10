@@ -9,7 +9,14 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import LEGACY_MARKER_NAMES, MARKER_NAME, REPO_TYPES, local_dir_for, type_root
+from .config import (
+    DATA_DIR,
+    LEGACY_MARKER_NAMES,
+    MARKER_NAME,
+    REPO_TYPES,
+    local_dir_for,
+    type_root,
+)
 
 # Size cache: walking a 500 GB directory takes a while, and the interface asks
 # for the listing on every view switch.
@@ -152,15 +159,11 @@ def repo_files(repo_type: str, repo_id: str, limit: int = 2000) -> list[dict[str
                 stat = full.stat()
             except OSError:
                 continue
-            out.append(
-                {
-                    "name": full.relative_to(path).as_posix(),
-                    "size": stat.st_size,
-                }
-            )
+            out.append({"name": full.relative_to(path).as_posix(), "size": stat.st_size})
             if len(out) >= limit:
-                out.sort(key=lambda f: f["name"])
-                return out
+                break
+        if len(out) >= limit:
+            break
     out.sort(key=lambda f: f["name"])
     return out
 
@@ -211,8 +214,6 @@ def delete_repo(repo_type: str, repo_id: str) -> dict[str, Any]:
 
 
 def disk_usage() -> dict[str, int]:
-    from .config import DATA_DIR
-
     try:
         usage = shutil.disk_usage(DATA_DIR)
         return {"total": usage.total, "free": usage.free}
