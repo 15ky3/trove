@@ -423,12 +423,20 @@
     state.updatesAt = data.checked_at;
     renderLibrary();
 
+    // Only repos that were actually compared belong in the count — skipped ones
+    // would make the total look like coverage it never had.
+    const compared = data.repos.filter((e) => !e.skipped && !e.error).length;
+    const skipped = data.repos.filter((e) => e.skipped).length;
     const failed = data.repos.filter((e) => e.error).length;
-    const note = failed ? ` ${failed} could not be checked.` : "";
+    const note = [
+      skipped ? `${skipped} skipped` : "",
+      failed ? `${failed} could not be checked` : "",
+    ].filter(Boolean).join(", ");
+    const tail = note ? ` (${note}.)` : "";
     if (data.outdated) {
-      toast(`${data.outdated} of ${data.repos.length} out of date.${note}`, "ok", "Updates available");
+      toast(`${data.outdated} of ${compared} checked are out of date.${tail}`, "ok", "Updates available");
     } else {
-      toast(`Everything is current.${note}`, "ok");
+      toast(compared ? `All ${compared} checked are current.${tail}` : `Nothing to check.${tail}`, "ok");
     }
     return data;
   }
