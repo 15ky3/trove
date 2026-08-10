@@ -197,11 +197,25 @@ def _as_pattern(filename: str) -> str:
 
 
 def _is_fatal(exc: BaseException) -> bool:
-    """Would a second attempt fail the same way?
+    """Would another attempt fail the same way?
 
-    Everything else — dropped connections, timeouts, a Hub that returns 5xx, a
-    Xet transfer that gives up — is worth retrying, so the default is to retry.
+    The cause chain is walked, not just the exception itself: a failed listing
+    arrives as a `DryRunError` wrapping the real reason, and that reason decides.
+    A repo that does not exist is hopeless, a Hub that timed out is not.
     """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_fatal_cause(current):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _is_fatal_cause(exc: BaseException) -> bool:
+    """Everything not named here — dropped connections, timeouts, a Hub that
+    returns 5xx, a Xet transfer that gives up — is worth another attempt."""
     from huggingface_hub.errors import (
         BadRequestError,
         DisabledRepoError,
@@ -240,6 +254,19 @@ def _is_fatal(exc: BaseException) -> bool:
     ):
         return True
     return False
+
+
+def _describe(exc: BaseException) -> str:
+    """The message worth showing.
+
+    huggingface_hub wraps a failed listing in a `DryRunError` that says to check
+    the connection or the token, whatever actually went wrong. The cause names
+    the real problem, so it goes first.
+    """
+    cause = exc.__cause__
+    if cause is not None and type(cause) is not type(exc):
+        return f"{type(cause).__name__}: {cause}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _backoff(attempt: int) -> int:
@@ -297,39 +324,39 @@ def run_download(payload: dict[str, Any]) -> None:
     try:
         while True:
             attempt += 1
-            log(f"Listing files in {repo_id} …")
-
-            plan = snapshot_download(**common, dry_run=True, tqdm_class=_reporter_tqdm_class())
-            total = sum(int(f.file_size or 0) for f in plan)
-            pending = [f for f in plan if f.will_download]
-            already = total - sum(int(f.file_size or 0) for f in pending)
-            commit = plan[0].commit_hash if plan else ""
-
-            # Re-read on every attempt: the failed one may well have completed
-            # a few files before it died, and those now count as done.
-            with progress.lock:
-                progress.total = total
-                progress.total_files = len(plan)
-                progress.done_files = len(plan) - len(pending)
-                progress.base = already
-                progress.written = 0
-                progress.transfer = 0
-
-            emit(
-                "meta",
-                total_bytes=total,
-                done_bytes=already,
-                total_files=len(plan),
-                done_files=len(plan) - len(pending),
-                commit=commit,
-            )
-
-            if not pending:
-                log("Every file is already here — nothing to do.")
-            else:
-                log(f"{len(pending)} file(s), {_fmt(total - already)} to fetch.")
-
             try:
+                log(f"Listing files in {repo_id} …")
+
+                plan = snapshot_download(**common, dry_run=True, tqdm_class=_reporter_tqdm_class())
+                total = sum(int(f.file_size or 0) for f in plan)
+                pending = [f for f in plan if f.will_download]
+                already = total - sum(int(f.file_size or 0) for f in pending)
+                commit = plan[0].commit_hash if plan else ""
+
+                # Re-read on every attempt: the failed one may well have
+                # completed a few files before it died, and those now count.
+                with progress.lock:
+                    progress.total = total
+                    progress.total_files = len(plan)
+                    progress.done_files = len(plan) - len(pending)
+                    progress.base = already
+                    progress.written = 0
+                    progress.transfer = 0
+
+                emit(
+                    "meta",
+                    total_bytes=total,
+                    done_bytes=already,
+                    total_files=len(plan),
+                    done_files=len(plan) - len(pending),
+                    commit=commit,
+                )
+
+                if not pending:
+                    log("Every file is already here — nothing to do.")
+                else:
+                    log(f"{len(pending)} file(s), {_fmt(total - already)} to fetch.")
+
                 path = snapshot_download(
                     **common,
                     max_workers=int(payload.get("max_workers") or 8),
@@ -340,7 +367,7 @@ def run_download(payload: dict[str, Any]) -> None:
                 if _is_fatal(exc) or attempt >= MAX_ATTEMPTS:
                     raise
                 delay = _backoff(attempt)
-                log(f"{type(exc).__name__}: {exc}", "error")
+                log(_describe(exc), "error")
                 log(
                     f"Attempt {attempt} of {MAX_ATTEMPTS} stopped. Trying again in "
                     f"{delay}s — every file that finished stays on disk.",
@@ -566,7 +593,7 @@ def main(argv: list[str]) -> int:
         return 143
     except Exception as exc:  # noqa: BLE001 - everything goes to the interface
         progress.stop()
-        emit("error", msg=f"{type(exc).__name__}: {exc}")
+        emit("error", msg=_describe(exc))
         return 1
     return 0
 
