@@ -132,6 +132,11 @@ class JobManager:
             self._watchdog = None
         for job_id in list(self._procs):
             await self._terminate(job_id)
+        # Let every transfer's task run out before the queue is written, or the
+        # file can miss the last state change and the pipes outlive the loop.
+        pending = list(self._tasks.values())
+        if pending:
+            await asyncio.wait(pending, timeout=15)
         self._save()
 
     # ----------------------------------------------------------- Persistence
@@ -384,6 +389,12 @@ class JobManager:
                 cwd=str(Path(__file__).resolve().parent.parent),
             )
             self._procs[job.id] = proc
+            # A job counts as running from the moment it is scheduled, but the
+            # process only exists a few milliseconds later. A cancel — or a
+            # shutdown — that landed in that window found nothing to signal and
+            # quietly did nothing, leaving the transfer running. Catch it up.
+            if job.id in self._cancelling or self._stopping:
+                await self._terminate(job.id)
             stderr_task = asyncio.create_task(self._drain_stderr(job, proc))
 
             assert proc.stdout is not None
