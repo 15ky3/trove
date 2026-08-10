@@ -30,7 +30,7 @@ _INTERNAL = {".cache", ".git", ".locks"}
 _DOWNLOAD_CACHE = (".cache", "huggingface", "download")
 
 
-def download_cache(path: Path) -> Path:
+def _download_cache(path: Path) -> Path:
     return path.joinpath(*_DOWNLOAD_CACHE)
 
 
@@ -54,7 +54,7 @@ def _dir_stats(path: Path) -> tuple[int, int, int]:
             total += stat.st_size
             files += 1
 
-    leftover = leftover_parts(path)[0]
+    leftover = leftover_size(path)
     _SIZE_CACHE[key] = (now, total, files, leftover)
     return total, files, leftover
 
@@ -187,7 +187,7 @@ def local_etags(repo_type: str, repo_id: str) -> dict[str, str]:
     files and the LFS sha256 for large ones — the same values the Hub reports,
     so comparing them says exactly which files moved.
     """
-    root = download_cache(local_dir_for(repo_type, repo_id))
+    root = _download_cache(local_dir_for(repo_type, repo_id))
     out: dict[str, str] = {}
     if not root.is_dir():
         return out
@@ -203,8 +203,8 @@ def local_etags(repo_type: str, repo_id: str) -> dict[str, str]:
     return out
 
 
-def leftover_parts(path: Path) -> tuple[int, int]:
-    """Half-written files a killed transfer left behind — (bytes, count).
+def _iter_leftover_parts(path: Path) -> Iterator[Path]:
+    """Half-written files a killed transfer left behind.
 
     huggingface_hub downloads every file to `<name>.<etag>.<uuid>.incomplete`
     and picks a fresh uuid on the next attempt, so a leftover can never be
@@ -213,32 +213,31 @@ def leftover_parts(path: Path) -> tuple[int, int]:
     down — leaves it behind for good. Nothing ever collects it, and `.cache` is
     excluded from the reported repo size, so the space disappears silently.
     """
-    root = download_cache(path)
+    root = _download_cache(path)
+    if root.is_dir():
+        yield from root.rglob("*.incomplete")
+
+
+def leftover_size(path: Path) -> int:
+    """How much space those leftovers hold."""
     total = 0
-    count = 0
-    if not root.is_dir():
-        return 0, 0
-    for part in root.rglob("*.incomplete"):
+    for part in _iter_leftover_parts(path):
         try:
             total += part.stat().st_size
         except OSError:
             continue
-        count += 1
-    return total, count
+    return total
 
 
 def drop_leftover_parts(path: Path) -> tuple[int, int]:
-    """Delete those leftovers and report what was reclaimed — (bytes, count).
+    """Delete them and report what was reclaimed — (bytes, count).
 
     Only safe while no transfer is writing into `path`: a running download owns
     an `.incomplete` file of its own.
     """
-    root = download_cache(path)
     total = 0
     count = 0
-    if not root.is_dir():
-        return 0, 0
-    for part in root.rglob("*.incomplete"):
+    for part in _iter_leftover_parts(path):
         try:
             size = part.stat().st_size
             part.unlink()

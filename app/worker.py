@@ -284,7 +284,10 @@ def _drop_leftovers(dest: Path) -> None:
     """
     freed, count = storage.drop_leftover_parts(dest)
     if count:
-        log(f"Cleared {count} unusable part file(s) from an earlier attempt — {_fmt(freed)} reclaimed.")
+        # A transfer killed early leaves files that are still empty; saying
+        # "0 B reclaimed" for those reads like a bug.
+        reclaimed = f" — {_fmt(freed)} reclaimed" if freed else ""
+        log(f"Cleared {count} unusable part file(s) from an earlier attempt{reclaimed}.")
 
 
 def run_download(payload: dict[str, Any]) -> None:

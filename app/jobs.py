@@ -38,8 +38,12 @@ MAX_CRASH_RESTARTS = 3
 
 
 def _exit_reason(code: int) -> str:
-    """Explain a worker that ended without reporting an error of its own."""
-    if code in (-9, 137):
+    """Explain a worker that ended without reporting an error of its own.
+
+    A process killed by a signal is reported as the negated signal number; 143
+    is the worker's own exit code when it caught a SIGTERM and shut down.
+    """
+    if code == -9:
         return (
             "The worker was killed (SIGKILL) — on a NAS this is almost always the "
             "kernel running out of memory. Lower 'Parallel transfers' or "
