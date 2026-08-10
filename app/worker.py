@@ -359,7 +359,7 @@ def run_download(payload: dict[str, Any]) -> None:
 
                 path = snapshot_download(
                     **common,
-                    max_workers=int(payload.get("max_workers") or 8),
+                    max_workers=int(payload.get("max_workers") or 4),
                     tqdm_class=_reporter_tqdm_class(),
                 )
                 break

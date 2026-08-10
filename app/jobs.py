@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .config import JOBS_FILE, local_dir_for, settings
+from .config import DEFAULT_SETTINGS, JOBS_FILE, local_dir_for, settings
 from . import storage
 
 QUEUED = "queued"
@@ -43,7 +43,7 @@ def _exit_reason(code: int) -> str:
         return (
             "The worker was killed (SIGKILL) — on a NAS this is almost always the "
             "kernel running out of memory. Lower 'Parallel transfers' or "
-            "'Threads per download' in Settings."
+            "'Files at once' in Settings."
         )
     if code in (-15, 143):
         return "The worker was stopped from outside (SIGTERM)."
@@ -348,7 +348,7 @@ class JobManager:
                 "files": job.files,
                 "allow_patterns": job.allow_patterns,
                 "ignore_patterns": job.ignore_patterns,
-                "max_workers": int(settings.get("max_workers") or 8),
+                "max_workers": int(settings.get("max_workers") or DEFAULT_SETTINGS["max_workers"]),
             }
         return [sys.executable, "-u", "-m", "app.worker", json.dumps(payload)]
 

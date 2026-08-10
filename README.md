@@ -111,7 +111,7 @@ by hand in the container — against the same folders.
 </tr>
 <tr>
 <td><img src="docs/picker.png" alt="File picker with two GGUF quants ticked out of twenty-one files"><br><sub><b>Pick files</b> — two quants ticked: 4.34 GB instead of 40.2 GB.</sub></td>
-<td><img src="docs/settings.png" alt="Settings with token, endpoint and concurrency"><br><sub><b>Settings</b> — token, endpoint, concurrency, threads per download.</sub></td>
+<td><img src="docs/settings.png" alt="Settings with token, endpoint and concurrency"><br><sub><b>Settings</b> — token, endpoint, parallel transfers, files at once.</sub></td>
 </tr>
 </table>
 
@@ -290,7 +290,7 @@ Trove keeps that window small:
   reclaims it.
 
 If a download is killed again and again, the cause is almost always memory:
-each transfer opens `Threads per download` files at once, and that multiplies
+each transfer opens `Files at once` files in parallel, and that multiplies
 with `Parallel transfers`. Two transfers with eight threads means sixteen
 downloads in flight. On a NAS, lowering either is the fix.
 

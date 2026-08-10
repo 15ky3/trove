@@ -37,8 +37,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "endpoint": "",
     # How many transfers may run at the same time.
     "max_concurrent": 2,
-    # Threads per download (hf_hub max_workers).
-    "max_workers": 8,
+    # How many files of one repo are fetched at the same time (hf_hub
+    # max_workers). Lower than huggingface_hub's own default of 8: every file in
+    # flight holds Xet transfer buffers, and this multiplies with
+    # max_concurrent. Four keeps a NAS out of trouble and still saturates a
+    # normal line; the interface allows up to 32.
+    "max_workers": 4,
     # Drop finished jobs from the queue list automatically.
     "auto_clear_done": False,
 }
