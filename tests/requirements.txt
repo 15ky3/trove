@@ -1,0 +1,4 @@
+pytest==8.4.2
+# Subprocess-based tests can hang instead of failing; a per-test ceiling turns
+# that into a traceback pointing at the culprit.
+pytest-timeout==2.4.0

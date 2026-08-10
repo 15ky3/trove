@@ -336,6 +336,27 @@ official CLI too. Trove resolves every repo ID to its canonical form when
 queueing, which also means typos and gated repos are reported immediately
 instead of failing minutes later.
 
+## Tests
+
+```bash
+./scripts/test.sh
+```
+
+The suite runs **inside the image**, against the same pinned dependencies that
+ship, and finishes in a few seconds. Nothing in it touches the network: the Hub
+is faked, and the transfer worker is replaced by a stub that can emit chosen
+events, hang, ignore SIGTERM, or kill itself with a signal — which is how the
+crash, cancellation and restart paths get covered without downloading anything.
+
+```bash
+./scripts/test.sh -k storage    # one slice
+./scripts/test.sh -x            # stop at the first failure
+```
+
+Two races in the queue were found by writing these: cancelling or shutting down
+in the moment between a job being scheduled and its process actually existing
+used to signal nothing at all, and the transfer ran on regardless.
+
 ## Troubleshooting on a NAS
 
 Two things bite specifically on NAS hardware. Both were found running Trove on a
