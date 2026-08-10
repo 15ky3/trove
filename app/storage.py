@@ -118,7 +118,8 @@ def list_repos(repo_type: str | None = None, refresh: bool = False) -> list[dict
                     "size": size,
                     "files": files,
                     "revision": marker.get("revision") or "",
-                    "commit": (marker.get("commit") or "")[:7],
+                    # Full sha — the UI shortens it, the update check compares it.
+                    "commit": marker.get("commit") or "",
                     "downloaded_at": marker.get("downloaded_at") or mtime,
                     "complete": bool(marker),
                     "files_selected": marker.get("files") or [],

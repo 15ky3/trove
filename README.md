@@ -76,7 +76,15 @@ public or private, with the same live progress.
 
 **Keep the shelf tidy**
 Sizes, file counts, revisions and commit hashes per repo. Inspect the files,
-re-fetch what changed upstream, delete what you no longer need.
+delete what you no longer need.
+
+</td></tr>
+<tr><td>
+
+**See what moved upstream**
+One click compares every repo against the Hub and marks the ones whose commit
+changed. Update a single repo or all of them at once. Copies where you picked
+individual files stay out of it.
 
 </td><td>
 
@@ -248,6 +256,22 @@ working; they just lose the byte readout, and the job log says so.
 
 The queue is stored in `CONFIG_DIR/jobs.json`, so it survives restarts:
 interrupted transfers are re-queued and continue.
+
+### Keeping copies current
+
+Every download records the commit it came from. **Check for updates** in the
+library asks the Hub for each repo's current commit and compares the two, so you
+find out what has moved without downloading anything. Repos that changed are
+marked, and you can queue them one at a time or all at once with **Update all**.
+
+Copies where you picked individual files are left out of the check on purpose. A
+differing commit says nothing about the handful of files you actually took — the
+change may well be in a file you never wanted. Those keep the **Refresh from
+Hub** button, which fetches the same selection again.
+
+Repos without a download record are skipped too: without a commit there is
+nothing to compare. That applies to folders written by something other than
+Trove, and to copies from before this feature existed.
 
 ### Picking individual files
 

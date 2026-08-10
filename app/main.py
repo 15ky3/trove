@@ -148,6 +148,13 @@ class DeleteBody(BaseModel):
     repo_type: str = "model"
 
 
+class UpdateBody(BaseModel):
+    repo_id: str = ""
+    repo_type: str = "model"
+    # Queue every repo the check found outdated, instead of a named one.
+    all_outdated: bool = False
+
+
 # ------------------------------------------------------------------ Basics/auth
 
 
@@ -282,6 +289,104 @@ async def library_files(
         raise HTTPException(status_code=400, detail="Invalid repo ID")
     files = await asyncio.to_thread(storage.repo_files, repo_type, repo_id)
     return {"files": files, "path": str(local_dir_for(repo_type, repo_id))}
+
+
+# How many repos to ask the Hub about at once. The check is one API call per
+# repo, so a large library would otherwise crawl — or look like a scraper.
+UPDATE_CHECK_CONCURRENCY = 8
+
+
+async def _check_updates() -> list[dict[str, Any]]:
+    """Compare the commit each repo was downloaded at against the Hub."""
+    repos = await asyncio.to_thread(storage.list_repos, None, False)
+    limit = asyncio.Semaphore(UPDATE_CHECK_CONCURRENCY)
+
+    async def check(repo: dict[str, Any]) -> dict[str, Any]:
+        entry = {
+            "repo_id": repo["repo_id"],
+            "repo_type": repo["repo_type"],
+            "revision": repo["revision"],
+            "commit": repo["commit"],
+            "remote_commit": "",
+            "outdated": False,
+            "skipped": "",
+            "error": "",
+        }
+        # A partial copy cannot be compared: its folder holds a hand-picked
+        # subset, so a differing commit says nothing about those files.
+        if repo["partial"]:
+            entry["skipped"] = "Only selected files were downloaded."
+            return entry
+        if not repo["commit"]:
+            entry["skipped"] = "No download record — the commit is unknown."
+            return entry
+        async with limit:
+            try:
+                resolved = await asyncio.to_thread(
+                    hub.resolve, repo["repo_id"], repo["repo_type"], repo["revision"] or None
+                )
+            except hub.HubError as exc:
+                entry["error"] = str(exc)
+                return entry
+        entry["remote_commit"] = resolved["sha"]
+        entry["outdated"] = bool(resolved["sha"]) and resolved["sha"] != repo["commit"]
+        return entry
+
+    return list(await asyncio.gather(*(check(repo) for repo in repos)))
+
+
+@app.get("/api/library/updates", dependencies=[Depends(require_auth)])
+async def library_updates() -> dict[str, Any]:
+    checked = await _check_updates()
+    return {
+        "repos": checked,
+        "outdated": sum(1 for entry in checked if entry["outdated"]),
+        "checked_at": time.time(),
+    }
+
+
+@app.post("/api/library/update", dependencies=[Depends(require_auth)])
+async def library_update(body: UpdateBody) -> dict[str, Any]:
+    if body.all_outdated:
+        targets = [entry for entry in await _check_updates() if entry["outdated"]]
+    else:
+        if not valid_repo_id(body.repo_id):
+            raise HTTPException(status_code=400, detail="Invalid repo ID")
+        if body.repo_type not in REPO_TYPES:
+            raise HTTPException(status_code=400, detail="Invalid repo type")
+        repos = await asyncio.to_thread(storage.list_repos, body.repo_type, False)
+        repo = next((r for r in repos if r["repo_id"] == body.repo_id), None)
+        if repo is None:
+            raise HTTPException(status_code=404, detail=f"{body.repo_id} is not in the library")
+        if repo["partial"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Only selected files were downloaded — use Refresh from Hub to fetch that same selection.",
+            )
+        targets = [dict(repo, remote_commit="")]
+
+    queued, skipped = [], []
+    for entry in targets:
+        active = any(
+            job.kind == "download"
+            and job.repo_id == entry["repo_id"]
+            and job.repo_type == entry["repo_type"]
+            and job.status in ACTIVE
+            for job in manager.jobs.values()
+        )
+        if active:
+            skipped.append(entry["repo_id"])
+            continue
+        await manager.add_download(
+            repo_id=entry["repo_id"],
+            repo_type=entry["repo_type"],
+            revision=entry.get("revision") or "",
+        )
+        queued.append(entry["repo_id"])
+
+    if not body.all_outdated and not queued:
+        raise HTTPException(status_code=409, detail=f"{body.repo_id} is already queued")
+    return {"queued": queued, "skipped": skipped}
 
 
 @app.post("/api/library/delete", dependencies=[Depends(require_auth)])
