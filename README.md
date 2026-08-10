@@ -78,6 +78,13 @@ public or private, with the same live progress.
 Sizes, file counts, revisions and commit hashes per repo. Inspect the files,
 delete what you no longer need.
 
+</td><td>
+
+**Survive a broken transfer**
+A dropped connection is retried on its own; a worker the kernel killed says so
+instead of pretending you cancelled it, and starts over. Finished files are
+always kept, and the dead weight a crash leaves behind is cleared.
+
 </td></tr>
 <tr><td>
 
@@ -104,7 +111,7 @@ by hand in the container — against the same folders.
 </tr>
 <tr>
 <td><img src="docs/picker.png" alt="File picker with two GGUF quants ticked out of twenty-one files"><br><sub><b>Pick files</b> — two quants ticked: 4.34 GB instead of 40.2 GB.</sub></td>
-<td><img src="docs/settings.png" alt="Settings with token, endpoint and concurrency"><br><sub><b>Settings</b> — token, endpoint, concurrency, threads per download.</sub></td>
+<td><img src="docs/settings.png" alt="Settings with token, endpoint and concurrency"><br><sub><b>Settings</b> — token, endpoint, parallel transfers, files at once.</sub></td>
 </tr>
 </table>
 
@@ -257,6 +264,36 @@ working; they just lose the byte readout, and the job log says so.
 The queue is stored in `CONFIG_DIR/jobs.json`, so it survives restarts:
 interrupted transfers are re-queued and continue.
 
+### When a transfer breaks
+
+A download is only ever as far along as the files it finished. `huggingface_hub`
+writes each file to a temporary name that belongs to that one attempt, so a file
+cut off halfway cannot be picked up again — but every file already in place is
+recognised and skipped. Losing a 400 GB download to a dropped connection an hour
+in is therefore not a thing; losing the one file that was open is.
+
+Trove keeps that window small:
+
+* **The worker retries by itself**, up to five times with a growing pause
+  (10s, 30s, 1m, 2m). It re-plans before each attempt, so it only fetches what is
+  genuinely still missing. Errors a retry cannot fix — repo gone, gated, no disk
+  space, no write access — stop immediately instead.
+* **A killed worker is not a cancelled one.** Out-of-memory kills used to show up
+  as "cancelled", which reads like something you did. They are now reported as
+  what they are, and the download starts over on its own up to three times.
+* **A shutdown is not a failure.** Transfers still running when the container
+  stops stay queued and continue on the next start.
+* **Half-written files are cleared.** A process killed by a signal never gets to
+  delete its temporary file, and nothing else collects it — so it sits there for
+  good, invisible, because `.cache` does not count towards the reported repo size.
+  The library now shows the wasted space, and the next download of that repo
+  reclaims it.
+
+If a download is killed again and again, the cause is almost always memory:
+each transfer opens `Files at once` files in parallel, and that multiplies
+with `Parallel transfers`. Two transfers with eight threads means sixteen
+downloads in flight. On a NAS, lowering either is the fix.
+
 ### Keeping copies current
 
 **Check for updates** in the library compares what you have against the Hub
@@ -298,6 +335,27 @@ redirect and returns a 404 partway through the download — this happens with th
 official CLI too. Trove resolves every repo ID to its canonical form when
 queueing, which also means typos and gated repos are reported immediately
 instead of failing minutes later.
+
+## Tests
+
+```bash
+./scripts/test.sh
+```
+
+The suite runs **inside the image**, against the same pinned dependencies that
+ship, and finishes in a few seconds. Nothing in it touches the network: the Hub
+is faked, and the transfer worker is replaced by a stub that can emit chosen
+events, hang, ignore SIGTERM, or kill itself with a signal — which is how the
+crash, cancellation and restart paths get covered without downloading anything.
+
+```bash
+./scripts/test.sh -k storage    # one slice
+./scripts/test.sh -x            # stop at the first failure
+```
+
+Two races in the queue were found by writing these: cancelling or shutting down
+in the moment between a job being scheduled and its process actually existing
+used to signal nothing at all, and the transfer ran on regardless.
 
 ## Troubleshooting on a NAS
 

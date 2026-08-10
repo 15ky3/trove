@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .config import JOBS_FILE, local_dir_for, settings
+from .config import DEFAULT_SETTINGS, JOBS_FILE, local_dir_for, settings
 from . import storage
 
 QUEUED = "queued"
@@ -29,6 +29,31 @@ LOG_LIMIT = 200
 # as stalled, so the queue stops looking busy while nothing happens.
 STALL_AFTER = 300.0
 STALL_INTERVAL = 30.0
+
+# How often a download whose worker died without a word may be started again.
+# The worker handles network trouble by itself, so reaching this point means the
+# process was killed — out of memory is by far the most common reason. Every
+# file that finished is on disk, so a fresh attempt only fetches the remainder.
+MAX_CRASH_RESTARTS = 3
+
+
+def _exit_reason(code: int) -> str:
+    """Explain a worker that ended without reporting an error of its own.
+
+    A process killed by a signal is reported as the negated signal number; 143
+    is the worker's own exit code when it caught a SIGTERM and shut down.
+    """
+    if code == -9:
+        return (
+            "The worker was killed (SIGKILL) — on a NAS this is almost always the "
+            "kernel running out of memory. Lower 'Parallel transfers' or "
+            "'Files at once' in Settings."
+        )
+    if code in (-15, 143):
+        return "The worker was stopped from outside (SIGTERM)."
+    if code < 0:
+        return f"The worker was killed by signal {-code}."
+    return f"Worker exited with code {code}"
 
 
 @dataclass
@@ -57,6 +82,8 @@ class Job:
     create_repo: bool = True
     commit_message: str = ""
     stalled: bool = False
+    #: How often this job was restarted after its worker died unexpectedly.
+    restarts: int = 0
     logs: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=LOG_LIMIT))
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,6 +111,7 @@ class JobManager:
         self._lock = asyncio.Lock()
         self._progress_at: dict[str, float] = {}
         self._watchdog: asyncio.Task | None = None
+        self._stopping = False
 
     # ------------------------------------------------------------- Lifecycle
 
@@ -96,11 +124,19 @@ class JobManager:
         await self._pump()
 
     async def shutdown(self) -> None:
+        # Transfers stopped by a shutdown stay marked as running, so the next
+        # start picks them up again instead of writing them off as cancelled.
+        self._stopping = True
         if self._watchdog is not None:
             self._watchdog.cancel()
             self._watchdog = None
         for job_id in list(self._procs):
             await self._terminate(job_id)
+        # Let every transfer's task run out before the queue is written, or the
+        # file can miss the last state change and the pipes outlive the loop.
+        pending = list(self._tasks.values())
+        if pending:
+            await asyncio.wait(pending, timeout=15)
         self._save()
 
     # ----------------------------------------------------------- Persistence
@@ -121,6 +157,8 @@ class JobManager:
                 job.status = QUEUED
                 job.speed = 0.0
             job.stalled = False
+            # A fresh start gets a fresh restart budget.
+            job.restarts = 0
             self.jobs[job.id] = job
             self.order.append(job.id)
 
@@ -237,6 +275,7 @@ class JobManager:
         job.done_files = 0
         job.started_at = 0.0
         job.finished_at = 0.0
+        job.restarts = 0
         self._log(job, "Trying again.")
         self._save()
         await self._push(job)
@@ -318,7 +357,7 @@ class JobManager:
                 "files": job.files,
                 "allow_patterns": job.allow_patterns,
                 "ignore_patterns": job.ignore_patterns,
-                "max_workers": int(settings.get("max_workers") or 8),
+                "max_workers": int(settings.get("max_workers") or DEFAULT_SETTINGS["max_workers"]),
             }
         return [sys.executable, "-u", "-m", "app.worker", json.dumps(payload)]
 
@@ -350,6 +389,12 @@ class JobManager:
                 cwd=str(Path(__file__).resolve().parent.parent),
             )
             self._procs[job.id] = proc
+            # A job counts as running from the moment it is scheduled, but the
+            # process only exists a few milliseconds later. A cancel — or a
+            # shutdown — that landed in that window found nothing to signal and
+            # quietly did nothing, leaving the transfer running. Catch it up.
+            if job.id in self._cancelling or self._stopping:
+                await self._terminate(job.id)
             stderr_task = asyncio.create_task(self._drain_stderr(job, proc))
 
             assert proc.stdout is not None
@@ -379,15 +424,23 @@ class JobManager:
         cancelled = job.id in self._cancelling
         self._cancelling.discard(job.id)
         self._progress_at.pop(job.id, None)
-        job.finished_at = time.time()
         job.speed = 0.0
         job.stalled = False
 
-        if cancelled or code in (143, -15, -9, 130):
+        # The container is going down. Leaving the job as it is means the next
+        # start re-queues it and carries on where the files on disk end.
+        if self._stopping and job.status == RUNNING:
+            self._save()
+            return
+
+        job.finished_at = time.time()
+
+        if cancelled:
             job.status = CANCELLED
             self._log(job, "Transfer cancelled.", "warn")
         elif code == 0 and job.status == RUNNING:
             job.status = DONE
+            job.restarts = 0
             if job.total_bytes:
                 job.done_bytes = job.total_bytes
             if job.total_files:
@@ -395,10 +448,26 @@ class JobManager:
             self._log(job, "Finished.", "ok")
             storage.invalidate()
         elif job.status == RUNNING:
-            job.status = ERROR
-            if not job.error:
-                job.error = f"Worker exited with code {code}"
-            self._log(job, job.error, "error")
+            # An empty job.error means the process died without saying anything:
+            # it was killed. The worker reports everything it can handle itself,
+            # so this is worth another go — with a limit, in case it is the kind
+            # of crash that repeats.
+            killed = not job.error
+            if killed and job.kind == "download" and job.restarts < MAX_CRASH_RESTARTS:
+                job.restarts += 1
+                job.status = QUEUED
+                job.finished_at = 0.0
+                self._log(
+                    job,
+                    f"{_exit_reason(code)} Starting over ({job.restarts}/{MAX_CRASH_RESTARTS}) — "
+                    "finished files are kept.",
+                    "warn",
+                )
+            else:
+                job.status = ERROR
+                if not job.error:
+                    job.error = _exit_reason(code)
+                self._log(job, job.error, "error")
 
         # The job may have been removed while its process was still shutting
         # down; broadcasting it now would resurrect it in every open tab.

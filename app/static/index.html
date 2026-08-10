@@ -215,10 +215,10 @@
           </div>
         </div>
         <div class="form-row">
-          <label for="set-workers">Threads per download</label>
+          <label for="set-workers">Files at once</label>
           <div class="form-control">
             <input class="field field-num mono" id="set-workers" type="number" min="1" max="32">
-            <p class="hint">Higher saturates fast connections but works the disk harder.</p>
+            <p class="hint">Files of the same repo fetched in parallel. Higher fills a fast line; each one in flight also costs memory, and a transfer that dies loses exactly these. Multiplies with the setting above.</p>
           </div>
         </div>
         <div class="form-row">

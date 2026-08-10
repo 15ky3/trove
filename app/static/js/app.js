@@ -315,6 +315,7 @@
       if (eta) meta.push(`<span>${eta}</span>`);
     }
     if (job.status === "queued") meta.push("<span>waiting for a free slot</span>");
+    if (job.restarts) meta.push(`<span class="is-warn">restarted ${job.restarts}×</span>`);
     if (job.status === "error" && job.error) meta.push(`<span class="is-err">${esc(job.error)}</span>`);
     if (job.status === "done" && job.finished_at) meta.push(`<span>${fmtRel(job.finished_at)}</span>`);
     meta.push(`<span class="path">${esc(job.kind === "upload" ? job.src : job.dest)}</span>`);
@@ -490,6 +491,7 @@
           <span>${fmtNum(repo.files)} files</span>
           ${repo.commit ? `<span>@${esc(shortSha(repo.commit))}</span>` : ""}
           ${update?.outdated ? `<span class="is-accent">${esc(updateSummary(update))}</span>` : ""}
+          ${repo.leftover ? `<span class="is-warn">${fmtBytes(repo.leftover)} unusable</span>` : ""}
           <span>${fmtRel(repo.downloaded_at)}</span>
           <span class="path">${esc(repo.path)}</span>
         </div>
@@ -924,6 +926,7 @@
         <h3>Path</h3>
         <p class="mono hint">${esc(data.path)}</p>
         ${repo?.partial ? `<p class="hint">Partial copy — updating fetches the same selection again, never the whole repo.</p>` : ""}
+        ${repo?.leftover ? `<p class="hint is-warn">${fmtBytes(repo.leftover)} of half-written files from a transfer that was killed. They cannot be resumed; the next download of this repo clears them.</p>` : ""}
         ${update?.outdated && update.partial ? `
           <p class="hint is-accent">Changed on the Hub since you downloaded them:</p>
           <p class="mono hint">${update.changed_files.map(esc).join("<br>")}</p>` : ""}

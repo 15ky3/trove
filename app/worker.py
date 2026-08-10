@@ -18,6 +18,7 @@ Talking to the parent: one JSON line per event on stdout.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import json
 import os
@@ -28,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import storage
 from .config import LEGACY_MARKER_NAMES, MARKER_NAME
 
 # Progress comes out of huggingface_hub's own tqdm objects; we do not want
@@ -35,6 +37,15 @@ from .config import LEGACY_MARKER_NAMES, MARKER_NAME
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 EMIT_INTERVAL = 0.9
+
+# snapshot_download gives up on the whole repo as soon as one file errors: the
+# files still open run to the end, but everything not yet started is dropped and
+# the call raises. Without a retry a single dropped connection ends the transfer
+# and the user has to notice and restart it by hand. Files that finished are on
+# disk and get skipped, so another attempt only fetches what is genuinely left.
+MAX_ATTEMPTS = 5
+#: Seconds to wait before attempt 2, 3, 4, 5 …; the last value repeats.
+RETRY_BACKOFF = (10, 30, 60, 120)
 
 
 # --------------------------------------------------------------------------- IPC
@@ -185,6 +196,100 @@ def _as_pattern(filename: str) -> str:
     return "".join(f"[{c}]" if c in "*?[" else c for c in filename)
 
 
+def _is_fatal(exc: BaseException) -> bool:
+    """Would another attempt fail the same way?
+
+    The cause chain is walked, not just the exception itself: a failed listing
+    arrives as a `DryRunError` wrapping the real reason, and that reason decides.
+    A repo that does not exist is hopeless, a Hub that timed out is not.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_fatal_cause(current):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _is_fatal_cause(exc: BaseException) -> bool:
+    """Everything not named here — dropped connections, timeouts, a Hub that
+    returns 5xx, a Xet transfer that gives up — is worth another attempt."""
+    from huggingface_hub.errors import (
+        BadRequestError,
+        DisabledRepoError,
+        HFValidationError,
+        HfHubHTTPError,
+        RemoteEntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+
+    # Missing, gated, renamed, or simply not a valid request: nothing changes by
+    # asking again. GatedRepoError subclasses RepositoryNotFoundError.
+    if isinstance(
+        exc,
+        (
+            RepositoryNotFoundError,
+            DisabledRepoError,
+            RevisionNotFoundError,
+            RemoteEntryNotFoundError,
+            HFValidationError,
+            BadRequestError,
+        ),
+    ):
+        return True
+    if isinstance(exc, HfHubHTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", 0)
+        return status in (400, 401, 403, 404)
+    # A full disk or a folder we may not write to. HfHubHTTPError is an OSError
+    # too, so this check has to come after it.
+    if isinstance(exc, OSError) and exc.errno in (
+        errno.ENOSPC,
+        errno.EDQUOT,
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+    ):
+        return True
+    return False
+
+
+def _describe(exc: BaseException) -> str:
+    """The message worth showing.
+
+    huggingface_hub wraps a failed listing in a `DryRunError` that says to check
+    the connection or the token, whatever actually went wrong. The cause names
+    the real problem, so it goes first.
+    """
+    cause = exc.__cause__
+    if cause is not None and type(cause) is not type(exc):
+        return f"{type(cause).__name__}: {cause}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _backoff(attempt: int) -> int:
+    return RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+
+
+def _drop_leftovers(dest: Path) -> None:
+    """Clear half-written files from a transfer that was killed.
+
+    They cannot be resumed — huggingface_hub names each temporary file after the
+    attempt that created it — and nothing else ever removes them, so a repo that
+    was interrupted a few times can sit on hundreds of gigabytes of dead weight.
+    This is the one moment where deleting them is safe: no transfer is writing
+    into this folder yet, and the API refuses a second job for the same repo.
+    """
+    freed, count = storage.drop_leftover_parts(dest)
+    if count:
+        # A transfer killed early leaves files that are still empty; saying
+        # "0 B reclaimed" for those reads like a bug.
+        reclaimed = f" — {_fmt(freed)} reclaimed" if freed else ""
+        log(f"Cleared {count} unusable part file(s) from an earlier attempt{reclaimed}.")
+
+
 def run_download(payload: dict[str, Any]) -> None:
     from huggingface_hub import snapshot_download
 
@@ -213,42 +318,69 @@ def run_download(payload: dict[str, Any]) -> None:
         ignore_patterns=ignore,
     )
 
-    log(f"Listing files in {repo_id} …")
+    dest.mkdir(parents=True, exist_ok=True)
+    _drop_leftovers(dest)
 
-    plan = snapshot_download(**common, dry_run=True, tqdm_class=_reporter_tqdm_class())
-    total = sum(int(f.file_size or 0) for f in plan)
-    pending = [f for f in plan if f.will_download]
-    already = total - sum(int(f.file_size or 0) for f in pending)
-
-    with progress.lock:
-        progress.total = total
-        progress.total_files = len(plan)
-        progress.done_files = len(plan) - len(pending)
-        progress.base = already
-
-    commit = plan[0].commit_hash if plan else ""
-    emit(
-        "meta",
-        total_bytes=total,
-        done_bytes=already,
-        total_files=len(plan),
-        done_files=len(plan) - len(pending),
-        commit=commit,
-    )
-
-    if not pending:
-        log("Every file is already here — nothing to do.")
-    else:
-        log(f"{len(pending)} file(s), {_fmt(total - already)} to fetch.")
-
+    commit = ""
+    attempt = 0
     progress.start()
     try:
-        dest.mkdir(parents=True, exist_ok=True)
-        path = snapshot_download(
-            **common,
-            max_workers=int(payload.get("max_workers") or 8),
-            tqdm_class=_reporter_tqdm_class(),
-        )
+        while True:
+            attempt += 1
+            try:
+                log(f"Listing files in {repo_id} …")
+
+                plan = snapshot_download(**common, dry_run=True, tqdm_class=_reporter_tqdm_class())
+                total = sum(int(f.file_size or 0) for f in plan)
+                pending = [f for f in plan if f.will_download]
+                already = total - sum(int(f.file_size or 0) for f in pending)
+                commit = plan[0].commit_hash if plan else ""
+
+                # Re-read on every attempt: the failed one may well have
+                # completed a few files before it died, and those now count.
+                with progress.lock:
+                    progress.total = total
+                    progress.total_files = len(plan)
+                    progress.done_files = len(plan) - len(pending)
+                    progress.base = already
+                    progress.written = 0
+                    progress.transfer = 0
+
+                emit(
+                    "meta",
+                    total_bytes=total,
+                    done_bytes=already,
+                    total_files=len(plan),
+                    done_files=len(plan) - len(pending),
+                    commit=commit,
+                )
+
+                if not pending:
+                    log("Every file is already here — nothing to do.")
+                else:
+                    log(f"{len(pending)} file(s), {_fmt(total - already)} to fetch.")
+
+                path = snapshot_download(
+                    **common,
+                    max_workers=int(payload.get("max_workers") or 4),
+                    tqdm_class=_reporter_tqdm_class(),
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - decided by _is_fatal
+                if _is_fatal(exc) or attempt >= MAX_ATTEMPTS:
+                    raise
+                delay = _backoff(attempt)
+                log(_describe(exc), "error")
+                log(
+                    f"Attempt {attempt} of {MAX_ATTEMPTS} stopped. Trying again in "
+                    f"{delay}s — every file that finished stays on disk.",
+                    "warn",
+                )
+                # The file that errored deletes its own temporary data, but a
+                # Xet transfer that died mid-write may not have; either way
+                # nothing here can be resumed.
+                _drop_leftovers(dest)
+                time.sleep(delay)
     finally:
         progress.stop()
 
@@ -464,7 +596,7 @@ def main(argv: list[str]) -> int:
         return 143
     except Exception as exc:  # noqa: BLE001 - everything goes to the interface
         progress.stop()
-        emit("error", msg=f"{type(exc).__name__}: {exc}")
+        emit("error", msg=_describe(exc))
         return 1
     return 0
 
