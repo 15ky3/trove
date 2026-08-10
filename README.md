@@ -78,6 +78,13 @@ public or private, with the same live progress.
 Sizes, file counts, revisions and commit hashes per repo. Inspect the files,
 delete what you no longer need.
 
+</td><td>
+
+**Survive a broken transfer**
+A dropped connection is retried on its own; a worker the kernel killed says so
+instead of pretending you cancelled it, and starts over. Finished files are
+always kept, and the dead weight a crash leaves behind is cleared.
+
 </td></tr>
 <tr><td>
 
@@ -256,6 +263,36 @@ working; they just lose the byte readout, and the job log says so.
 
 The queue is stored in `CONFIG_DIR/jobs.json`, so it survives restarts:
 interrupted transfers are re-queued and continue.
+
+### When a transfer breaks
+
+A download is only ever as far along as the files it finished. `huggingface_hub`
+writes each file to a temporary name that belongs to that one attempt, so a file
+cut off halfway cannot be picked up again — but every file already in place is
+recognised and skipped. Losing a 400 GB download to a dropped connection an hour
+in is therefore not a thing; losing the one file that was open is.
+
+Trove keeps that window small:
+
+* **The worker retries by itself**, up to five times with a growing pause
+  (10s, 30s, 1m, 2m). It re-plans before each attempt, so it only fetches what is
+  genuinely still missing. Errors a retry cannot fix — repo gone, gated, no disk
+  space, no write access — stop immediately instead.
+* **A killed worker is not a cancelled one.** Out-of-memory kills used to show up
+  as "cancelled", which reads like something you did. They are now reported as
+  what they are, and the download starts over on its own up to three times.
+* **A shutdown is not a failure.** Transfers still running when the container
+  stops stay queued and continue on the next start.
+* **Half-written files are cleared.** A process killed by a signal never gets to
+  delete its temporary file, and nothing else collects it — so it sits there for
+  good, invisible, because `.cache` does not count towards the reported repo size.
+  The library now shows the wasted space, and the next download of that repo
+  reclaims it.
+
+If a download is killed again and again, the cause is almost always memory:
+each transfer opens `Threads per download` files at once, and that multiplies
+with `Parallel transfers`. Two transfers with eight threads means sixteen
+downloads in flight. On a NAS, lowering either is the fix.
 
 ### Keeping copies current
 

@@ -467,6 +467,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .tape-meta .is-live { color: var(--text-dim); }
 .tape-meta .is-err { color: var(--err); white-space: normal; }
 .tape-meta .is-accent { color: var(--accent); }
+.tape-meta .is-warn { color: var(--warn); }
 
 .tape-side {
   grid-row: 1 / span 2;
@@ -532,6 +533,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .hint.is-ok { color: var(--ok); }
 .hint.is-err { color: var(--err); }
 .hint.is-accent { color: var(--accent); }
+.hint.is-warn { color: var(--warn); }
 
 .form-actions {
   display: flex;
