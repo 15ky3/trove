@@ -20,20 +20,27 @@ from .config import (
 
 # Size cache: walking a 500 GB directory takes a while, and the interface asks
 # for the listing on every view switch.
-_SIZE_CACHE: dict[str, tuple[float, int, int]] = {}
+_SIZE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 _CACHE_TTL = 60.0
 
 # Internal folders that do not count as repo content.
 _INTERNAL = {".cache", ".git", ".locks"}
 
+#: Where huggingface_hub keeps its per-file bookkeeping inside a local dir.
+_DOWNLOAD_CACHE = (".cache", "huggingface", "download")
 
-def _dir_stats(path: Path) -> tuple[int, int]:
-    """(bytes, file_count), served from a short-lived cache."""
+
+def download_cache(path: Path) -> Path:
+    return path.joinpath(*_DOWNLOAD_CACHE)
+
+
+def _dir_stats(path: Path) -> tuple[int, int, int]:
+    """(bytes, file_count, leftover_bytes), served from a short-lived cache."""
     key = str(path)
     now = time.time()
     cached = _SIZE_CACHE.get(key)
     if cached and now - cached[0] < _CACHE_TTL:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
 
     total = 0
     files = 0
@@ -47,8 +54,9 @@ def _dir_stats(path: Path) -> tuple[int, int]:
             total += stat.st_size
             files += 1
 
-    _SIZE_CACHE[key] = (now, total, files)
-    return total, files
+    leftover = leftover_parts(path)[0]
+    _SIZE_CACHE[key] = (now, total, files, leftover)
+    return total, files, leftover
 
 
 def invalidate(path: Path | None = None) -> None:
@@ -111,7 +119,7 @@ def list_repos(repo_type: str | None = None, refresh: bool = False) -> list[dict
             continue
         for path in _iter_repo_dirs(root):
             marker = _read_marker(path)
-            size, files = _dir_stats(path)
+            size, files, leftover = _dir_stats(path)
             rel = path.relative_to(root).as_posix()
             try:
                 mtime = path.stat().st_mtime
@@ -124,6 +132,9 @@ def list_repos(repo_type: str | None = None, refresh: bool = False) -> list[dict
                     "path": str(path),
                     "size": size,
                     "files": files,
+                    # Space held by half-written files from a killed transfer;
+                    # the next download of this repo clears it.
+                    "leftover": leftover,
                     "revision": marker.get("revision") or "",
                     # Full sha — the UI shortens it, the update check compares it.
                     "commit": marker.get("commit") or "",
@@ -176,7 +187,7 @@ def local_etags(repo_type: str, repo_id: str) -> dict[str, str]:
     files and the LFS sha256 for large ones — the same values the Hub reports,
     so comparing them says exactly which files moved.
     """
-    root = local_dir_for(repo_type, repo_id) / ".cache" / "huggingface" / "download"
+    root = download_cache(local_dir_for(repo_type, repo_id))
     out: dict[str, str] = {}
     if not root.is_dir():
         return out
@@ -192,12 +203,60 @@ def local_etags(repo_type: str, repo_id: str) -> dict[str, str]:
     return out
 
 
+def leftover_parts(path: Path) -> tuple[int, int]:
+    """Half-written files a killed transfer left behind — (bytes, count).
+
+    huggingface_hub downloads every file to `<name>.<etag>.<uuid>.incomplete`
+    and picks a fresh uuid on the next attempt, so a leftover can never be
+    resumed. It normally deletes its own file, but a process that dies without
+    running its cleanup — SIGKILL, an out-of-memory kill, a container that goes
+    down — leaves it behind for good. Nothing ever collects it, and `.cache` is
+    excluded from the reported repo size, so the space disappears silently.
+    """
+    root = download_cache(path)
+    total = 0
+    count = 0
+    if not root.is_dir():
+        return 0, 0
+    for part in root.rglob("*.incomplete"):
+        try:
+            total += part.stat().st_size
+        except OSError:
+            continue
+        count += 1
+    return total, count
+
+
+def drop_leftover_parts(path: Path) -> tuple[int, int]:
+    """Delete those leftovers and report what was reclaimed — (bytes, count).
+
+    Only safe while no transfer is writing into `path`: a running download owns
+    an `.incomplete` file of its own.
+    """
+    root = download_cache(path)
+    total = 0
+    count = 0
+    if not root.is_dir():
+        return 0, 0
+    for part in root.rglob("*.incomplete"):
+        try:
+            size = part.stat().st_size
+            part.unlink()
+        except OSError:
+            continue
+        total += size
+        count += 1
+    if count:
+        invalidate(path)
+    return total, count
+
+
 def delete_repo(repo_type: str, repo_id: str) -> dict[str, Any]:
     path = local_dir_for(repo_type, repo_id)
     if not path.is_dir():
         raise FileNotFoundError(f"{repo_id} is not stored locally")
 
-    size, files = _dir_stats(path)
+    size, files, leftover = _dir_stats(path)
     shutil.rmtree(path)
     invalidate(path)
 
@@ -210,7 +269,7 @@ def delete_repo(repo_type: str, repo_id: str) -> dict[str, Any]:
         except OSError:
             pass
 
-    return {"deleted": str(path), "freed": size, "files": files}
+    return {"deleted": str(path), "freed": size + leftover, "files": files}
 
 
 def disk_usage() -> dict[str, int]:
