@@ -63,9 +63,9 @@ class Progress:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.base = 0  # bereits vor dem Start vorhandene Bytes
-        self.written = 0  # auf Platte geschriebene Bytes (reconstruct)
-        self.transfer = 0  # tatsaechlich uebertragene Bytes (Netz)
+        self.base = 0  # bytes already on disk before this run started
+        self.written = 0  # bytes written to disk (reconstruct)
+        self.transfer = 0  # bytes actually pulled over the network
         self.total = 0
         self.total_files = 0
         self.done_files = 0
@@ -84,24 +84,20 @@ class Progress:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            done = self.base + self.written
-            moved = self.base + self.transfer
+            # Xet writes to disk in bursts while the network is already ahead
+            # (or the other way round when dedup kicks in). Whichever counter is
+            # further along is the honest live estimate.
+            reference = max(self.base + self.written, self.base + self.transfer)
             now = time.monotonic()
             elapsed = now - self._last_time
-            reference = max(done, moved)
             if elapsed >= 0.25:
                 rate = (reference - self._last_bytes) / elapsed
                 # Exponentially smoothed, or the readout jumps on every chunk.
                 self._speed = rate if self._speed == 0 else 0.35 * rate + 0.65 * self._speed
                 self._last_bytes = reference
                 self._last_time = now
-            # Xet writes to disk in bursts while the network is already ahead
-            # (or the other way round when dedup kicks in). Whichever counter is
-            # further along is the honest live estimate — capped at the total so
-            # retries cannot push the bar past 100%.
-            reported = max(done, moved)
-            if self.total:
-                reported = min(reported, self.total)
+            # Capped, so a retry cannot push the bar past 100%.
+            reported = min(reference, self.total) if self.total else reference
 
             return {
                 "done_bytes": reported,
@@ -461,12 +457,12 @@ def main(argv: list[str]) -> int:
             run_download(payload)
     except SystemExit:
         progress.stop()
-        emit("log", msg="Cancelled.", level="warn")
+        log("Cancelled.", "warn")
         return 143
     except KeyboardInterrupt:
         progress.stop()
         return 143
-    except Exception as exc:  # noqa: BLE001 - alles Richtung UI melden
+    except Exception as exc:  # noqa: BLE001 - everything goes to the interface
         progress.stop()
         emit("error", msg=f"{type(exc).__name__}: {exc}")
         return 1

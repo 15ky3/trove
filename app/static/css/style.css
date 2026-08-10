@@ -466,6 +466,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .tape-meta .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .tape-meta .is-live { color: var(--text-dim); }
 .tape-meta .is-err { color: var(--err); white-space: normal; }
+.tape-meta .is-accent { color: var(--accent); }
 
 .tape-side {
   grid-row: 1 / span 2;
@@ -530,6 +531,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .hint { font-size: 11.5px; color: var(--text-faint); line-height: 1.45; }
 .hint.is-ok { color: var(--ok); }
 .hint.is-err { color: var(--err); }
+.hint.is-accent { color: var(--accent); }
 
 .form-actions {
   display: flex;

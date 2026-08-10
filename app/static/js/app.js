@@ -13,6 +13,7 @@
     library: [],
     libType: "",
     libFilter: "",
+    updates: {},        // "type:repo_id" -> result of the last update check
     hubType: "model",
     hubResults: [],
     settings: {},
@@ -54,6 +55,8 @@
   }
 
   const fmtNum = (n) => new Intl.NumberFormat("en-GB").format(Number(n) || 0);
+  const shortSha = (sha) => String(sha || "").slice(0, 7);
+  const csv = (sel) => $(sel).value.split(",").map((s) => s.trim()).filter(Boolean);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -61,6 +64,10 @@
     const i = String(repoId).indexOf("/");
     return i < 0 ? { org: "", name: repoId } : { org: repoId.slice(0, i + 1), name: repoId.slice(i + 1) };
   }
+
+  const ACTIVE = ["queued", "running"];
+  const isActive = (job) => ACTIVE.includes(job.status);
+  const activeCount = () => state.jobs.filter(isActive).length;
 
   const TYPE_LABEL = { model: "Model", dataset: "Dataset", space: "Space" };
   const STATUS_LABEL = {
@@ -160,7 +167,7 @@
 
   function upsertJob(job) {
     const index = state.jobs.findIndex((j) => j.id === job.id);
-    const wasActive = index >= 0 && ["queued", "running"].includes(state.jobs[index].status);
+    const wasActive = index >= 0 && isActive(state.jobs[index]);
     if (index >= 0) state.jobs[index] = job; else state.jobs.push(job);
     // A finished download changes the library, so pull it again.
     if (wasActive && job.status === "done") { loadLibrary(); loadDisk(); }
@@ -254,7 +261,7 @@
         ? `${state.library.length} repos · ${fmtBytes(total)} in ${state.dataDir || "/data"}`
         : "Nothing downloaded yet";
     } else if (state.view === "queue") {
-      const active = state.jobs.filter((j) => ["queued", "running"].includes(j.status)).length;
+      const active = activeCount();
       sub.textContent = active ? `${active} active · ${state.jobs.length} total` : `${state.jobs.length} entries`;
     } else if (state.view === "hub") {
       sub.textContent = state.hubResults.length ? `${state.hubResults.length} results` : "Search the Hugging Face Hub";
@@ -266,7 +273,7 @@
   }
 
   function renderNavCounts() {
-    const active = state.jobs.filter((j) => ["queued", "running"].includes(j.status)).length;
+    const active = activeCount();
     const queue = $('[data-count="queue"]');
     queue.textContent = active || "";
     queue.classList.toggle("is-live", active > 0);
@@ -316,14 +323,14 @@
 
   function jobNumHTML(job) {
     const pct = Math.round(progressOf(job) * 100);
-    const head = ["running", "queued"].includes(job.status) ? `${pct} %` : STATUS_LABEL[job.status];
+    const head = isActive(job) ? `${pct} %` : STATUS_LABEL[job.status];
     const sub = job.total_files ? `${fmtNum(job.done_files)}/${fmtNum(job.total_files)} files` : "—";
     return `<b>${head}</b><span>${sub}</span>`;
   }
 
   function jobRowHTML(job) {
     const { org, name } = splitId(job.repo_id);
-    const actions = ["queued", "running"].includes(job.status)
+    const actions = isActive(job)
       ? `<button class="btn btn-sm btn-danger" data-act="cancel">Cancel</button>`
       : `<button class="btn btn-sm" data-act="retry">Try again</button>
          <button class="btn btn-sm btn-danger" data-act="forget" title="Remove from the list">Remove</button>`;
@@ -408,7 +415,50 @@
 
   /* ----------------------------------------------------------------- Library */
 
+  const updateKey = (repo) => `${repo.repo_type}:${repo.repo_id}`;
+  const updateFor = (repo) => state.updates[updateKey(repo)];
+  const findRepo = (repoId, repoType) =>
+    state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
+
+  // Whole copies moved to a new commit; partial ones report the files that
+  // changed, because their commit says nothing about the selection.
+  function updateSummary(update) {
+    if (!update.partial) return `→ @${shortSha(update.remote_commit)}`;
+    const n = update.changed_files.length;
+    return `${fmtNum(n)} of ${fmtNum(update.tracked_files)} ${n === 1 ? "file" : "files"} changed`;
+  }
+
+  // One Hub request per repo, so this is deliberately a button rather than
+  // something that runs on every library load.
+  async function checkUpdates() {
+    const data = await api("/api/library/updates");
+    state.updates = {};
+    data.repos.forEach((entry) => { state.updates[updateKey(entry)] = entry; });
+    renderLibrary();
+
+    // Only repos that were actually compared belong in the count — skipped ones
+    // would make the total look like coverage it never had.
+    const compared = data.repos.filter((e) => !e.skipped && !e.error).length;
+    const skipped = data.repos.filter((e) => e.skipped).length;
+    const failed = data.repos.filter((e) => e.error).length;
+    const note = [
+      skipped ? `${skipped} skipped` : "",
+      failed ? `${failed} could not be checked` : "",
+    ].filter(Boolean).join(", ");
+    const tail = note ? ` (${note}.)` : "";
+    if (data.outdated) {
+      toast(`${data.outdated} of ${compared} checked are out of date.${tail}`, "ok", "Updates available");
+    } else {
+      toast(compared ? `All ${compared} checked are current.${tail}` : `Nothing to check.${tail}`, "ok");
+    }
+  }
+
   function renderLibrary() {
+    const outdated = Object.values(state.updates).filter((e) => e.outdated).length;
+    const all = $("#lib-update-all");
+    all.hidden = !outdated;
+    all.textContent = `Update all (${outdated})`;
+
     const list = $("#lib-list");
     const filter = state.libFilter.toLowerCase();
     const repos = state.library.filter(
@@ -424,6 +474,7 @@
 
     list.innerHTML = repos.map((repo) => {
       const { org, name } = splitId(repo.repo_id);
+      const update = updateFor(repo);
       return `
       <div class="tape is-clickable" data-repo="${esc(repo.repo_id)}" data-type="${esc(repo.repo_type)}" style="--p:0%">
         <div class="tape-id">
@@ -433,16 +484,19 @@
           ${repo.revision && repo.revision !== "main" ? `<span class="tag">${esc(repo.revision)}</span>` : ""}
           ${repo.partial ? `<span class="tag">selected files</span>` : ""}
           ${repo.complete ? "" : `<span class="tag is-err">incomplete</span>`}
+          ${update?.outdated ? `<span class="tag is-accent">update available</span>` : ""}
         </div>
         <div class="tape-meta">
           <span>${fmtNum(repo.files)} files</span>
-          ${repo.commit ? `<span>@${esc(repo.commit)}</span>` : ""}
+          ${repo.commit ? `<span>@${esc(shortSha(repo.commit))}</span>` : ""}
+          ${update?.outdated ? `<span class="is-accent">${esc(updateSummary(update))}</span>` : ""}
           <span>${fmtRel(repo.downloaded_at)}</span>
           <span class="path">${esc(repo.path)}</span>
         </div>
         <div class="tape-side">
           <div class="tape-num"><b>${fmtBytes(repo.size)}</b><span>on disk</span></div>
           <div class="tape-actions">
+            ${update?.outdated ? `<button class="btn btn-sm btn-accent" data-act="update">Update</button>` : ""}
             <button class="btn btn-sm" data-act="files">Files</button>
             <button class="btn btn-sm" data-act="upload">Upload</button>
             <button class="btn btn-sm btn-danger" data-act="delete">Delete</button>
@@ -461,13 +515,10 @@
     const action = button ? button.dataset.act : "files";
 
     if (action === "files") { openLocalSheet(repoId, repoType); return; }
-    if (action === "upload") {
-      const repo = state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
-      prefillUpload(repo);
-      return;
-    }
+    if (action === "update") { await runUpdate({ repo_id: repoId, repo_type: repoType }); return; }
+    if (action === "upload") { prefillUpload(findRepo(repoId, repoType)); return; }
     if (action === "delete") {
-      const repo = state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
+      const repo = findRepo(repoId, repoType);
       if (!confirm(`Delete ${repoId}?\n\nThis frees ${repo ? fmtBytes(repo.size) : "the folder"} and cannot be undone.`)) return;
       try {
         const res = await api("/api/library/delete", { method: "POST", body: { repo_id: repoId, repo_type: repoType } });
@@ -488,6 +539,42 @@
   $("#lib-search").addEventListener("input", (event) => {
     state.libFilter = event.target.value.trim();
     renderLibrary();
+  });
+
+  async function runUpdate(body) {
+    try {
+      const res = await api("/api/library/update", { method: "POST", body });
+      if (!res.queued.length) {
+        toast(res.skipped.length ? "Already in the queue." : "Nothing to update.");
+        return;
+      }
+      // Queued repos are being replaced, so the old check result is stale.
+      res.queued.forEach((id) => {
+        Object.keys(state.updates).forEach((key) => {
+          if (state.updates[key].repo_id === id) state.updates[key].outdated = false;
+        });
+      });
+      renderLibrary();
+      const extra = res.skipped.length ? ` ${res.skipped.length} already queued.` : "";
+      toast(`${res.queued.length} queued.${extra}`, "ok", "Update started");
+      closeSheet();
+      setView("queue");
+    } catch (err) { fail(err); }
+  }
+
+  $("#lib-check").addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    const label = event.target.textContent;
+    event.target.textContent = "Checking…";
+    try { await checkUpdates(); }
+    catch (err) { fail(err); }
+    finally { event.target.disabled = false; event.target.textContent = label; }
+  });
+
+  $("#lib-update-all").addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    try { await runUpdate({ all_outdated: true }); }
+    finally { event.target.disabled = false; }
   });
 
   $("#lib-refresh").addEventListener("click", async (event) => {
@@ -803,19 +890,19 @@
     wirePicker();
 
     $("#sheet-download").addEventListener("click", () => {
-      const patterns = (id) => $(`#${id}`).value.split(",").map((s) => s.trim()).filter(Boolean);
       startDownload(repoId, repoType, {
         revision: $("#sheet-rev").value.trim(),
         files: selectedFiles(),
-        allow_patterns: patterns("sheet-allow"),
-        ignore_patterns: patterns("sheet-ignore"),
+        allow_patterns: csv("#sheet-allow"),
+        ignore_patterns: csv("#sheet-ignore"),
       });
     });
   }
 
   async function openLocalSheet(repoId, repoType) {
     state.sheet = { kind: "local", id: repoId };
-    const repo = state.library.find((r) => r.repo_id === repoId && r.repo_type === repoType);
+    const repo = findRepo(repoId, repoType);
+    const update = updateFor({ repo_id: repoId, repo_type: repoType });
     openSheet("Local", repoId, `<p class="hint">Reading the folder…</p>`, "");
     let data;
     try {
@@ -831,12 +918,19 @@
         ${statHTML("Size", fmtBytes(repo?.size || 0))}
         ${statHTML("Files", fmtNum(data.files.length))}
         ${statHTML("Revision", esc(repo?.revision || "main"))}
-        ${statHTML("Commit", esc(repo?.commit || "—"))}
+        ${statHTML("Commit", esc(shortSha(repo?.commit) || "—"))}
       </div>
       <div class="sheet-section">
         <h3>Path</h3>
         <p class="mono hint">${esc(data.path)}</p>
-        ${repo?.partial ? `<p class="hint">Partial copy — refreshing keeps the same selection.</p>` : ""}
+        ${repo?.partial ? `<p class="hint">Partial copy — updating fetches the same selection again, never the whole repo.</p>` : ""}
+        ${update?.outdated && update.partial ? `
+          <p class="hint is-accent">Changed on the Hub since you downloaded them:</p>
+          <p class="mono hint">${update.changed_files.map(esc).join("<br>")}</p>` : ""}
+        ${update?.outdated && !update.partial ? `<p class="hint is-accent">The Hub is at @${esc(shortSha(update.remote_commit))} — updating replaces this copy.</p>` : ""}
+        ${update && !update.outdated && !update.skipped && !update.error ? `<p class="hint is-ok">Up to date as of the last check.</p>` : ""}
+        ${update?.skipped ? `<p class="hint">${esc(update.skipped)}</p>` : ""}
+        ${update?.error ? `<p class="hint is-err">${esc(update.error)}</p>` : ""}
       </div>
       <div class="sheet-section">
         <h3>Files</h3>
@@ -844,17 +938,20 @@
       </div>`;
 
     $("#sheet-foot").innerHTML = `
-      <button class="btn" id="sheet-update">Refresh from Hub</button>
+      <button class="btn ${update?.outdated ? "btn-accent" : ""}" id="sheet-update">${
+        update?.outdated
+          ? (update.partial ? `Update ${fmtNum(update.changed_files.length)} changed` : `Update to @${esc(shortSha(update.remote_commit))}`)
+          : "Refresh from Hub"
+      }</button>
       <button class="btn" id="sheet-upload">Upload</button>
       <span class="spacer"></span>
       <button class="btn btn-danger" id="sheet-delete">Delete</button>`;
 
-    $("#sheet-update").addEventListener("click", () => startDownload(repoId, repoType, {
-      revision: repo?.revision || "",
-      files: repo?.files_selected || [],
-      allow_patterns: repo?.allow_patterns || [],
-      ignore_patterns: repo?.ignore_patterns || [],
-    }));
+    // Both labels do the same thing: re-fetch exactly what is recorded for
+    // this copy. The server reads that off the marker, so no selection travels
+    // back and forth.
+    $("#sheet-update").addEventListener("click", () =>
+      runUpdate({ repo_id: repoId, repo_type: repoType }));
     $("#sheet-upload").addEventListener("click", () => { prefillUpload(repo); closeSheet(); });
     $("#sheet-delete").addEventListener("click", async () => {
       if (!confirm(`Delete ${repoId}? This cannot be undone.`)) return;
@@ -934,7 +1031,7 @@
       private: $("#up-private").checked,
       create_repo: $("#up-create").checked,
       commit_message: $("#up-msg").value.trim(),
-      ignore_patterns: $("#up-ignore").value.split(",").map((s) => s.trim()).filter(Boolean),
+      ignore_patterns: csv("#up-ignore"),
     };
     try {
       await api("/api/jobs/upload", { method: "POST", body });
