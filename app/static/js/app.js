@@ -727,12 +727,241 @@
       dir ? `<span class="dir">${esc(dir)}</span>` : ""}<span class="base">${esc(base)}</span></span>`;
   }
 
-  const fileListHTML = (files, limit = 400) => `
-    <div class="file-list">
-      ${files.slice(0, limit).map((f) => `
-        <div class="file-row">${fileLabelHTML(f.name)}<span class="file-size">${fmtBytes(f.size)}</span></div>`).join("")}
-      ${files.length > limit ? `<div class="file-row"><span>… ${fmtNum(files.length - limit)} more</span><span></span></div>` : ""}
-    </div>`;
+  /* ------------------------------------------------- Browsing a stored repo */
+
+  // The listing arrives flat ("onnx/model.onnx"), but a repo with folders reads
+  // like one: the rows below show a single level and descend on click. The tick
+  // boxes pick files to delete; a folder ticks everything underneath it.
+  const browser = {
+    repoId: "", repoType: "", files: [], dir: "", filter: "",
+    selected: new Set(), truncated: false,
+  };
+
+  const BROWSE_LIMIT = 400;
+
+  function browserFiles(dir) {
+    const prefix = dir ? `${dir}/` : "";
+    return browser.files.filter((f) => f.name.startsWith(prefix));
+  }
+
+  // What the current view offers, either as one folder level or — while a
+  // filter is set — as matches from the whole repo.
+  function visibleFiles() {
+    const needle = browser.filter.trim().toLowerCase();
+    if (!needle) return browserFiles(browser.dir);
+    return browser.files.filter((f) => f.name.toLowerCase().includes(needle));
+  }
+
+  function browserEntries() {
+    const prefix = browser.dir ? `${browser.dir}/` : "";
+    const dirs = new Map();
+    const files = [];
+    for (const file of browserFiles(browser.dir)) {
+      const rest = file.name.slice(prefix.length);
+      const cut = rest.indexOf("/");
+      if (cut < 0) { files.push({ ...file, base: rest }); continue; }
+      const label = rest.slice(0, cut);
+      const entry = dirs.get(label) || { label, path: prefix + label, size: 0, count: 0 };
+      entry.size += file.size;
+      entry.count += 1;
+      dirs.set(label, entry);
+    }
+    // Numeric collation, so model-9-of-10 sorts before model-10-of-10.
+    const byName = (a, b) => a.localeCompare(b, "en", { numeric: true });
+    return {
+      dirs: [...dirs.values()].sort((a, b) => byName(a.label, b.label)),
+      files: files.sort((a, b) => byName(a.base, b.base)),
+    };
+  }
+
+  const selectedFilesLocal = () => browser.files.filter((f) => browser.selected.has(f.name));
+  const sumSize = (files) => files.reduce((sum, f) => sum + f.size, 0);
+
+  function pick(names, on) {
+    names.forEach((name) => (on ? browser.selected.add(name) : browser.selected.delete(name)));
+  }
+
+  function fileRowHTML(name, label, size) {
+    const on = browser.selected.has(name);
+    return `
+      <label class="file-row is-pick ${on ? "is-on" : ""}" data-file="${esc(name)}">
+        <input type="checkbox" ${on ? "checked" : ""}>
+        ${fileLabelHTML(label)}
+        <span class="file-size">${fmtBytes(size)}</span>
+      </label>`;
+  }
+
+  function dirRowHTML(entry) {
+    const picked = browserFiles(entry.path).filter((f) => browser.selected.has(f.name)).length;
+    return `
+      <div class="file-row is-pick is-dir ${picked === entry.count ? "is-on" : ""}" data-dir="${esc(entry.path)}">
+        <input type="checkbox" ${picked === entry.count ? "checked" : ""}>
+        <span class="file-name"><span class="base">${esc(entry.label)}/</span></span>
+        <span class="parts">${fmtNum(entry.count)} ${entry.count === 1 ? "file" : "files"}</span>
+        <span class="file-size">${fmtBytes(entry.size)}</span>
+        <span class="go" aria-hidden="true">›</span>
+      </div>`;
+  }
+
+  const noteRowHTML = (text) => `<div class="file-row"><span>${esc(text)}</span><span></span></div>`;
+
+  function browserRowsHTML() {
+    if (browser.filter.trim()) {
+      const hits = visibleFiles();
+      if (!hits.length) return noteRowHTML("No file matches that filter.");
+      return hits.slice(0, BROWSE_LIMIT).map((f) => fileRowHTML(f.name, f.name, f.size)).join("")
+        + (hits.length > BROWSE_LIMIT
+          ? noteRowHTML(`… ${fmtNum(hits.length - BROWSE_LIMIT)} more — narrow the filter to reach them.`)
+          : "");
+    }
+    const { dirs, files } = browserEntries();
+    if (!dirs.length && !files.length) return noteRowHTML("This folder is empty.");
+    return dirs.map(dirRowHTML).join("")
+      + files.slice(0, BROWSE_LIMIT).map((f) => fileRowHTML(f.name, f.base, f.size)).join("")
+      + (files.length > BROWSE_LIMIT
+        ? noteRowHTML(`… ${fmtNum(files.length - BROWSE_LIMIT)} more in this folder — use the filter.`)
+        : "");
+  }
+
+  function crumbsHTML() {
+    const root = splitId(browser.repoId).name;
+    const out = [`<button type="button" data-to="">${esc(root)}</button>`];
+    let acc = "";
+    (browser.dir ? browser.dir.split("/") : []).forEach((part) => {
+      acc = acc ? `${acc}/${part}` : part;
+      out.push(`<span class="sep">/</span><button type="button" data-to="${esc(acc)}">${esc(part)}</button>`);
+    });
+    return out.join("");
+  }
+
+  // A tick box cannot express "some of it" in markup, only in script.
+  function paintPartialTicks() {
+    $$("#br-list .file-row[data-dir]").forEach((row) => {
+      const under = browserFiles(row.dataset.dir);
+      const picked = under.filter((f) => browser.selected.has(f.name)).length;
+      const box = $("input", row);
+      box.checked = picked === under.length && under.length > 0;
+      box.indeterminate = picked > 0 && picked < under.length;
+      row.classList.toggle("is-on", box.checked);
+    });
+  }
+
+  function renderBrowserState() {
+    const picked = selectedFilesLocal();
+    $("#br-summary").textContent = picked.length
+      ? `${fmtNum(picked.length)} of ${fmtNum(browser.files.length)} files selected · ${fmtBytes(sumSize(picked))}`
+      : `${fmtNum(browser.files.length)} files · ${fmtBytes(sumSize(browser.files))}`;
+
+    const visible = visibleFiles();
+    const here = visible.filter((f) => browser.selected.has(f.name)).length;
+    const all = $("#br-all");
+    all.checked = visible.length > 0 && here === visible.length;
+    all.indeterminate = here > 0 && here < visible.length;
+
+    const button = $("#sheet-prune");
+    if (button) {
+      button.hidden = picked.length === 0;
+      button.textContent = `Delete ${fmtNum(picked.length)} file${picked.length === 1 ? "" : "s"} · ${fmtBytes(sumSize(picked))}`;
+    }
+    paintPartialTicks();
+  }
+
+  function renderBrowser() {
+    $("#br-crumbs").innerHTML = crumbsHTML();
+    $("#br-list").innerHTML = browserRowsHTML();
+    $("#br-list").scrollTop = 0;
+    renderBrowserState();
+  }
+
+  function browserHTML(data) {
+    browser.files = data.files;
+    browser.dir = "";
+    browser.filter = "";
+    browser.selected = new Set();
+    browser.truncated = !!data.truncated;
+    return `
+      <div class="browser">
+        <div class="browser-head">
+          <label class="check"><input type="checkbox" id="br-all"> <span>All shown</span></label>
+          <nav class="crumbs" id="br-crumbs"></nav>
+          <input class="field field-sm" id="br-filter" placeholder="Filter, e.g. .safetensors" autocomplete="off">
+        </div>
+        <div class="file-list" id="br-list"></div>
+        <p class="hint" id="br-summary"></p>
+        ${browser.truncated ? `<p class="hint is-warn">Only the first ${fmtNum(data.files.length)} files are listed — this repo holds more, and the rest cannot be picked here.</p>` : ""}
+      </div>`;
+  }
+
+  function wireBrowser() {
+    const list = $("#br-list");
+
+    list.addEventListener("click", (event) => {
+      // The tick box picks the folder; anything else opens it.
+      if (event.target.matches("input")) return;
+      const row = event.target.closest(".file-row[data-dir]");
+      if (!row) return;
+      browser.dir = row.dataset.dir;
+      renderBrowser();
+    });
+
+    list.addEventListener("change", (event) => {
+      const row = event.target.closest(".file-row[data-file], .file-row[data-dir]");
+      if (!row) return;
+      const on = event.target.checked;
+      pick(row.dataset.dir !== undefined
+        ? browserFiles(row.dataset.dir).map((f) => f.name)
+        : [row.dataset.file], on);
+      row.classList.toggle("is-on", on);
+      renderBrowserState();
+    });
+
+    $("#br-crumbs").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-to]");
+      if (!button) return;
+      browser.dir = button.dataset.to;
+      renderBrowser();
+    });
+
+    $("#br-filter").addEventListener("input", (event) => {
+      browser.filter = event.target.value;
+      renderBrowser();
+    });
+
+    $("#br-all").addEventListener("change", (event) => {
+      pick(visibleFiles().map((f) => f.name), event.target.checked);
+      $("#br-list").innerHTML = browserRowsHTML();
+      renderBrowserState();
+    });
+
+    renderBrowser();
+  }
+
+  async function pruneSelected(repoId, repoType) {
+    const picked = selectedFilesLocal();
+    if (!picked.length) return;
+    const rest = browser.files.length - picked.length;
+    const consequence = rest === 0
+      ? `That is every file — ${repoId} leaves the library.`
+      : `An update then fetches the remaining ${fmtNum(rest)} files only, never these again.`;
+    if (!confirm(`Delete ${fmtNum(picked.length)} file(s) from ${repoId}?\n\nThis frees ${fmtBytes(sumSize(picked))} and cannot be undone.\n${consequence}`)) return;
+
+    try {
+      const res = await api("/api/library/files/delete", {
+        method: "POST",
+        body: { repo_id: repoId, repo_type: repoType, files: picked.map((f) => f.name) },
+      });
+      // The last update check counted files that are no longer there.
+      delete state.updates[`${repoType}:${repoId}`];
+      toast(res.removed_repo
+        ? `${repoId} held nothing else and is gone — ${fmtBytes(res.freed)} freed.`
+        : `${fmtNum(res.deleted.length)} file(s) deleted — ${fmtBytes(res.freed)} freed.`, "ok");
+      if (res.missing.length) toast(`${fmtNum(res.missing.length)} were already gone.`);
+      if (res.warning) toast(res.warning, "err", "Selection not updated");
+      await Promise.all([loadLibrary(), loadDisk()]);
+      if (res.removed_repo) { closeSheet(); return; }
+      openLocalSheet(repoId, repoType);
+    } catch (err) { fail(err); }
+  }
 
   /* ------------------------------------------------------------ Picking files */
 
@@ -903,6 +1132,8 @@
 
   async function openLocalSheet(repoId, repoType) {
     state.sheet = { kind: "local", id: repoId };
+    browser.repoId = repoId;
+    browser.repoType = repoType;
     const repo = findRepo(repoId, repoType);
     const update = updateFor({ repo_id: repoId, repo_type: repoType });
     openSheet("Local", repoId, `<p class="hint">Reading the folder…</p>`, "");
@@ -937,7 +1168,8 @@
       </div>
       <div class="sheet-section">
         <h3>Files</h3>
-        ${fileListHTML(data.files)}
+        <p class="hint">Open a folder to look inside. Whatever you tick can be deleted — and an update stops fetching it.</p>
+        ${browserHTML(data)}
       </div>`;
 
     $("#sheet-foot").innerHTML = `
@@ -948,13 +1180,17 @@
       }</button>
       <button class="btn" id="sheet-upload">Upload</button>
       <span class="spacer"></span>
-      <button class="btn btn-danger" id="sheet-delete">Delete</button>`;
+      <button class="btn btn-danger" id="sheet-prune" hidden></button>
+      <button class="btn btn-danger" id="sheet-delete">Delete repo</button>`;
+
+    wireBrowser();
 
     // Both labels do the same thing: re-fetch exactly what is recorded for
     // this copy. The server reads that off the marker, so no selection travels
     // back and forth.
     $("#sheet-update").addEventListener("click", () =>
       runUpdate({ repo_id: repoId, repo_type: repoType }));
+    $("#sheet-prune").addEventListener("click", () => pruneSelected(repoId, repoType));
     $("#sheet-upload").addEventListener("click", () => { prefillUpload(repo); closeSheet(); });
     $("#sheet-delete").addEventListener("click", async () => {
       if (!confirm(`Delete ${repoId}? This cannot be undone.`)) return;
