@@ -641,20 +641,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .file-row:last-child { border-bottom: 0; }
 .file-row > span:last-child { color: var(--text-faint); font-variant-numeric: tabular-nums; flex: none; }
 
-/* Picking files — single quants instead of the whole repo. */
+/* Picking and browsing files — one folder level at a time. */
 
-.picker-head {
+.tree-head {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   margin-bottom: 8px;
+  flex-wrap: wrap;
 }
-.picker-head .check { flex: none; }
-.picker-head .field { flex: 1; min-width: 0; }
+.tree-head .check { flex: none; }
+.tree-head .field { flex: 1 1 160px; min-width: 0; }
 .field-sm { height: 27px; font-size: 12px; }
-
-#pick-list { max-height: 340px; overflow-y: auto; }
-#pick-summary { margin-top: 9px; }
 
 .file-row.is-pick {
   justify-content: flex-start;
@@ -700,18 +698,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .file-row .file-size { flex: none; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
-/* Browsing a stored repo — one folder level at a time. */
-
-.browser-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-.browser-head .check { flex: none; }
-.browser-head .field { flex: 1 1 160px; min-width: 0; }
-
 .crumbs {
   display: flex;
   align-items: center;
@@ -736,8 +722,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .crumbs button:last-child:hover { color: var(--text); }
 .crumbs .sep { color: var(--text-faint); opacity: 0.5; }
 
-#br-list { max-height: 340px; overflow-y: auto; }
-#br-summary { margin-top: 9px; }
+#tree-list { max-height: 340px; overflow-y: auto; }
+#tree-summary { margin-top: 9px; }
 
 .file-row.is-dir .base { color: var(--text); }
 .file-row.is-dir .go {

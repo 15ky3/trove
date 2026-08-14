@@ -62,8 +62,8 @@ reads at a glance.
 
 **Take one file, not the whole repo**
 A GGUF repo can hold twenty quants and 40 GB when you want a single 1.9 GB one.
-Tick the files you want and only those come down. Split quants are listed as one
-entry, so you always get every part.
+Walk the repo folder by folder, tick what you want, and only that comes down.
+Split quants are listed as one entry, so you always get every part.
 
 </td><td>
 
@@ -318,11 +318,19 @@ before this existed.
 
 ### Picking individual files
 
-Ticking files in the detail panel is a friendlier front end for
-`allow_patterns`: each name is turned into an exact pattern (glob characters in
-a filename are escaped, so a literal `[` stays a `[`). Files split across parts —
+Both file lists — the repo you are about to download and the one you already
+have — are the same browser. It shows one folder level at a time, descends on
+click, leads back out through a breadcrumb, and its filter searches the whole
+repo when a path is what you are after. Ticks survive navigating away and back,
+so a pick can span folders.
+
+Ticking files before a download is a friendlier front end for `allow_patterns`:
+each name is turned into an exact pattern (glob characters in a filename are
+escaped, so a literal `[` stays a `[`). Files split across parts —
 `…-00001-of-00002.gguf`, `model-00001-of-00004.safetensors` — are grouped into a
-single entry, because half of a split quant is worth nothing.
+single entry, because half of a split quant is worth nothing. Split quants also
+tend to sit alone in a folder named exactly like themselves; that folder is
+shown as the entry it holds rather than as a stop on the way.
 
 The selection is stored alongside the download, so **Refresh from Hub** on a
 partial copy fetches the same files again instead of suddenly pulling the whole
@@ -330,10 +338,8 @@ repo. Partial copies are marked as such in the library.
 
 ### Editing a repo you already have
 
-The file list in the detail panel is a browser: folders are shown as folders and
-open on click, a breadcrumb leads back out, and a filter searches the whole repo
-at once. Tick anything — a single file or a whole folder — and **Delete n files**
-removes it.
+Tick anything in the library's file browser — a single file or a whole folder —
+and **Delete n files** removes it.
 
 Deleting is more than an `rm`. Along with the file goes the record
 `huggingface_hub` keeps for it, and the selection stored with the copy is

@@ -726,108 +726,144 @@
     return `<span class="file-name"${dir ? ` title="${esc(name)}"` : ""}>${
       dir ? `<span class="dir">${esc(dir)}</span>` : ""}<span class="base">${esc(base)}</span></span>`;
   }
+  /* --------------------------------------------------------------- File tree */
 
-  /* ------------------------------------------------- Browsing a stored repo */
-
-  // The listing arrives flat ("onnx/model.onnx"), but a repo with folders reads
-  // like one: the rows below show a single level and descend on click. The tick
-  // boxes pick files to delete; a folder ticks everything underneath it.
-  const browser = {
-    repoId: "", repoType: "", files: [], dir: "", filter: "",
-    selected: new Set(), truncated: false,
+  // One component for both file lists: the repo you already have and the one
+  // you are about to download. It shows a single folder level at a time,
+  // descends on click and picks with tick boxes — what a pick then *means* is
+  // the caller's business (delete these, or fetch only these).
+  //
+  // Its unit is an item: one file, or a set of files that only makes sense as a
+  // whole, addressed by the full path it sits at.
+  const tree = {
+    items: [],
+    dir: "",
+    filter: "",
+    selected: new Set(),   // item paths
+    root: "",              // label of the first crumb
+    onChange: () => {},
   };
 
-  const BROWSE_LIMIT = 400;
+  const TREE_LIMIT = 400;
 
-  function browserFiles(dir) {
-    const prefix = dir ? `${dir}/` : "";
-    return browser.files.filter((f) => f.name.startsWith(prefix));
+  // Files split across parts (model-00001-of-00004.safetensors, a GGUF quant in
+  // several pieces) belong together — ticked individually they would be useless.
+  const SHARD_RE = /^(.*?)[-_]?(\d{5})-of-(\d{5})(\.[A-Za-z0-9]+)$/;
+
+  function groupFiles(files) {
+    const groups = new Map();
+    for (const file of files) {
+      const match = file.name.match(SHARD_RE);
+      // The leading path stays in the label, so the group sits in its folder.
+      const path = match ? `${match[1]}${match[4]}` : file.name;
+      const key = match ? `${match[1]}|${match[3]}|${match[4]}` : file.name;
+      if (!groups.has(key)) groups.set(key, { path, names: [], size: 0 });
+      const group = groups.get(key);
+      group.names.push(file.name);
+      group.size += file.size;
+    }
+    return [...groups.values()];
   }
 
-  // What the current view offers, either as one folder level or — while a
-  // filter is set — as matches from the whole repo.
-  function visibleFiles() {
-    const needle = browser.filter.trim().toLowerCase();
-    if (!needle) return browserFiles(browser.dir);
-    return browser.files.filter((f) => f.name.toLowerCase().includes(needle));
+  const plainItems = (files) => files.map((f) => ({ path: f.name, names: [f.name], size: f.size }));
+
+  const treeUnder = (dir) => tree.items.filter((it) => it.path.startsWith(dir ? `${dir}/` : ""));
+
+  // What the current view offers: one folder level, or — while a filter is set —
+  // matches from the whole repo.
+  function treeVisible() {
+    const needle = tree.filter.trim().toLowerCase();
+    if (!needle) return treeUnder(tree.dir);
+    return tree.items.filter((it) => it.path.toLowerCase().includes(needle));
   }
 
-  function browserEntries() {
-    const prefix = browser.dir ? `${browser.dir}/` : "";
+  function treeEntries() {
+    const prefix = tree.dir ? `${tree.dir}/` : "";
     const dirs = new Map();
-    const files = [];
-    for (const file of browserFiles(browser.dir)) {
-      const rest = file.name.slice(prefix.length);
+    const leaves = [];
+    for (const item of treeUnder(tree.dir)) {
+      const rest = item.path.slice(prefix.length);
       const cut = rest.indexOf("/");
-      if (cut < 0) { files.push({ ...file, base: rest }); continue; }
+      if (cut < 0) { leaves.push({ item, label: rest }); continue; }
       const label = rest.slice(0, cut);
-      const entry = dirs.get(label) || { label, path: prefix + label, size: 0, count: 0 };
-      entry.size += file.size;
-      entry.count += 1;
+      const entry = dirs.get(label) || { label, path: prefix + label, size: 0, files: 0, items: 0 };
+      entry.size += item.size;
+      entry.files += item.names.length;
+      entry.items += 1;
       dirs.set(label, entry);
     }
+
+    // A split quant lives in a folder named exactly like the file inside it.
+    // Making that folder a stop on the way would hide the one thing it holds,
+    // so a folder whose only entry already spans several files is shown as that
+    // entry instead.
+    for (const [label, entry] of [...dirs]) {
+      if (entry.items !== 1 || entry.files < 2) continue;
+      const [item] = treeUnder(entry.path);
+      leaves.push({ item, label: item.path.slice(prefix.length) });
+      dirs.delete(label);
+    }
+
     // Numeric collation, so model-9-of-10 sorts before model-10-of-10.
     const byName = (a, b) => a.localeCompare(b, "en", { numeric: true });
     return {
       dirs: [...dirs.values()].sort((a, b) => byName(a.label, b.label)),
-      files: files.sort((a, b) => byName(a.base, b.base)),
+      leaves: leaves.sort((a, b) => byName(a.label, b.label)),
     };
   }
 
-  const selectedFilesLocal = () => browser.files.filter((f) => browser.selected.has(f.name));
-  const sumSize = (files) => files.reduce((sum, f) => sum + f.size, 0);
+  const treePicked = () => tree.items.filter((it) => tree.selected.has(it.path));
+  const treeFiles = () => treePicked().flatMap((it) => it.names);
+  const treeCount = (items) => items.reduce((sum, it) => sum + it.names.length, 0);
+  const treeSize = (items) => items.reduce((sum, it) => sum + it.size, 0);
 
-  function pick(names, on) {
-    names.forEach((name) => (on ? browser.selected.add(name) : browser.selected.delete(name)));
+  function treePick(items, on) {
+    items.forEach((item) => (on ? tree.selected.add(item.path) : tree.selected.delete(item.path)));
   }
 
-  function fileRowHTML(name, label, size) {
-    const on = browser.selected.has(name);
+  function treeLeafHTML(item, label) {
+    const on = tree.selected.has(item.path);
     return `
-      <label class="file-row is-pick ${on ? "is-on" : ""}" data-file="${esc(name)}">
+      <label class="file-row is-pick ${on ? "is-on" : ""}" data-item="${esc(item.path)}">
         <input type="checkbox" ${on ? "checked" : ""}>
         ${fileLabelHTML(label)}
-        <span class="file-size">${fmtBytes(size)}</span>
+        ${item.names.length > 1 ? `<span class="parts">${item.names.length} parts</span>` : ""}
+        <span class="file-size">${fmtBytes(item.size)}</span>
       </label>`;
   }
 
-  function dirRowHTML(entry) {
-    const picked = browserFiles(entry.path).filter((f) => browser.selected.has(f.name)).length;
-    return `
-      <div class="file-row is-pick is-dir ${picked === entry.count ? "is-on" : ""}" data-dir="${esc(entry.path)}">
-        <input type="checkbox" ${picked === entry.count ? "checked" : ""}>
-        <span class="file-name"><span class="base">${esc(entry.label)}/</span></span>
-        <span class="parts">${fmtNum(entry.count)} ${entry.count === 1 ? "file" : "files"}</span>
-        <span class="file-size">${fmtBytes(entry.size)}</span>
-        <span class="go" aria-hidden="true">›</span>
-      </div>`;
-  }
+  const treeDirHTML = (entry) => `
+    <div class="file-row is-pick is-dir" data-dir="${esc(entry.path)}">
+      <input type="checkbox">
+      <span class="file-name"><span class="base">${esc(entry.label)}/</span></span>
+      <span class="parts">${fmtNum(entry.files)} ${entry.files === 1 ? "file" : "files"}</span>
+      <span class="file-size">${fmtBytes(entry.size)}</span>
+      <span class="go" aria-hidden="true">›</span>
+    </div>`;
 
-  const noteRowHTML = (text) => `<div class="file-row"><span>${esc(text)}</span><span></span></div>`;
+  const treeNoteHTML = (text) => `<div class="file-row"><span>${esc(text)}</span><span></span></div>`;
 
-  function browserRowsHTML() {
-    if (browser.filter.trim()) {
-      const hits = visibleFiles();
-      if (!hits.length) return noteRowHTML("No file matches that filter.");
-      return hits.slice(0, BROWSE_LIMIT).map((f) => fileRowHTML(f.name, f.name, f.size)).join("")
-        + (hits.length > BROWSE_LIMIT
-          ? noteRowHTML(`… ${fmtNum(hits.length - BROWSE_LIMIT)} more — narrow the filter to reach them.`)
-          : "");
+  const treeMoreHTML = (hidden, where) =>
+    treeNoteHTML(`… ${fmtNum(hidden)} more ${where} — narrow it down with the filter.`);
+
+  function treeRowsHTML() {
+    if (tree.filter.trim()) {
+      const hits = treeVisible();
+      if (!hits.length) return treeNoteHTML("Nothing matches that filter.");
+      return hits.slice(0, TREE_LIMIT).map((it) => treeLeafHTML(it, it.path)).join("")
+        + (hits.length > TREE_LIMIT ? treeMoreHTML(hits.length - TREE_LIMIT, "matching") : "");
     }
-    const { dirs, files } = browserEntries();
-    if (!dirs.length && !files.length) return noteRowHTML("This folder is empty.");
-    return dirs.map(dirRowHTML).join("")
-      + files.slice(0, BROWSE_LIMIT).map((f) => fileRowHTML(f.name, f.base, f.size)).join("")
-      + (files.length > BROWSE_LIMIT
-        ? noteRowHTML(`… ${fmtNum(files.length - BROWSE_LIMIT)} more in this folder — use the filter.`)
-        : "");
+    const { dirs, leaves } = treeEntries();
+    if (!dirs.length && !leaves.length) return treeNoteHTML("This folder is empty.");
+    return dirs.map(treeDirHTML).join("")
+      + leaves.slice(0, TREE_LIMIT).map((e) => treeLeafHTML(e.item, e.label)).join("")
+      + (leaves.length > TREE_LIMIT ? treeMoreHTML(leaves.length - TREE_LIMIT, "in this folder") : "");
   }
 
-  function crumbsHTML() {
-    const root = splitId(browser.repoId).name;
-    const out = [`<button type="button" data-to="">${esc(root)}</button>`];
+  function treeCrumbsHTML() {
+    const out = [`<button type="button" data-to="">${esc(tree.root)}</button>`];
     let acc = "";
-    (browser.dir ? browser.dir.split("/") : []).forEach((part) => {
+    (tree.dir ? tree.dir.split("/") : []).forEach((part) => {
       acc = acc ? `${acc}/${part}` : part;
       out.push(`<span class="sep">/</span><button type="button" data-to="${esc(acc)}">${esc(part)}</button>`);
     });
@@ -835,120 +871,106 @@
   }
 
   // A tick box cannot express "some of it" in markup, only in script.
-  function paintPartialTicks() {
-    $$("#br-list .file-row[data-dir]").forEach((row) => {
-      const under = browserFiles(row.dataset.dir);
-      const picked = under.filter((f) => browser.selected.has(f.name)).length;
-      const box = $("input", row);
-      box.checked = picked === under.length && under.length > 0;
-      box.indeterminate = picked > 0 && picked < under.length;
-      row.classList.toggle("is-on", box.checked);
+  function paintTreeTicks() {
+    const boxes = [[$("#tree-all"), treeVisible()]];
+    $$("#tree-list .file-row[data-dir]").forEach((row) => boxes.push([$("input", row), treeUnder(row.dataset.dir)]));
+    boxes.forEach(([box, items]) => {
+      const on = items.filter((it) => tree.selected.has(it.path)).length;
+      box.checked = items.length > 0 && on === items.length;
+      box.indeterminate = on > 0 && on < items.length;
+      box.closest(".file-row")?.classList.toggle("is-on", box.checked);
     });
   }
 
-  function renderBrowserState() {
-    const picked = selectedFilesLocal();
-    $("#br-summary").textContent = picked.length
-      ? `${fmtNum(picked.length)} of ${fmtNum(browser.files.length)} files selected · ${fmtBytes(sumSize(picked))}`
-      : `${fmtNum(browser.files.length)} files · ${fmtBytes(sumSize(browser.files))}`;
-
-    const visible = visibleFiles();
-    const here = visible.filter((f) => browser.selected.has(f.name)).length;
-    const all = $("#br-all");
-    all.checked = visible.length > 0 && here === visible.length;
-    all.indeterminate = here > 0 && here < visible.length;
-
-    const button = $("#sheet-prune");
-    if (button) {
-      button.hidden = picked.length === 0;
-      button.textContent = `Delete ${fmtNum(picked.length)} file${picked.length === 1 ? "" : "s"} · ${fmtBytes(sumSize(picked))}`;
-    }
-    paintPartialTicks();
+  function renderTreeState() {
+    paintTreeTicks();
+    tree.onChange();
   }
 
-  function renderBrowser() {
-    $("#br-crumbs").innerHTML = crumbsHTML();
-    $("#br-list").innerHTML = browserRowsHTML();
-    $("#br-list").scrollTop = 0;
-    renderBrowserState();
+  function renderTree() {
+    $("#tree-crumbs").innerHTML = treeCrumbsHTML();
+    $("#tree-list").innerHTML = treeRowsHTML();
+    $("#tree-list").scrollTop = 0;
+    renderTreeState();
   }
 
-  function browserHTML(data) {
-    browser.files = data.files;
-    browser.dir = "";
-    browser.filter = "";
-    browser.selected = new Set();
-    browser.truncated = !!data.truncated;
+  function treeHTML(items, root, hint = "") {
+    tree.items = items;
+    tree.dir = "";
+    tree.filter = "";
+    tree.selected = new Set();
+    tree.root = root;
     return `
-      <div class="browser">
-        <div class="browser-head">
-          <label class="check"><input type="checkbox" id="br-all"> <span>All shown</span></label>
-          <nav class="crumbs" id="br-crumbs"></nav>
-          <input class="field field-sm" id="br-filter" placeholder="Filter, e.g. .safetensors" autocomplete="off">
+      <div>
+        <div class="tree-head">
+          <label class="check"><input type="checkbox" id="tree-all"> <span>All shown</span></label>
+          <nav class="crumbs" id="tree-crumbs"></nav>
+          <input class="field field-sm" id="tree-filter" placeholder="Filter, e.g. Q4_K_M" autocomplete="off">
         </div>
-        <div class="file-list" id="br-list"></div>
-        <p class="hint" id="br-summary"></p>
-        ${browser.truncated ? `<p class="hint is-warn">Only the first ${fmtNum(data.files.length)} files are listed — this repo holds more, and the rest cannot be picked here.</p>` : ""}
+        <div class="file-list" id="tree-list"></div>
+        <p class="hint" id="tree-summary"></p>
+        ${hint}
       </div>`;
   }
 
-  function wireBrowser() {
-    const list = $("#br-list");
+  function wireTree(onChange) {
+    tree.onChange = onChange;
+    const list = $("#tree-list");
 
     list.addEventListener("click", (event) => {
       // The tick box picks the folder; anything else opens it.
       if (event.target.matches("input")) return;
       const row = event.target.closest(".file-row[data-dir]");
       if (!row) return;
-      browser.dir = row.dataset.dir;
-      renderBrowser();
+      tree.dir = row.dataset.dir;
+      renderTree();
     });
 
     list.addEventListener("change", (event) => {
-      const row = event.target.closest(".file-row[data-file], .file-row[data-dir]");
+      const row = event.target.closest(".file-row[data-item], .file-row[data-dir]");
       if (!row) return;
       const on = event.target.checked;
-      pick(row.dataset.dir !== undefined
-        ? browserFiles(row.dataset.dir).map((f) => f.name)
-        : [row.dataset.file], on);
+      treePick(row.dataset.dir !== undefined
+        ? treeUnder(row.dataset.dir)
+        : tree.items.filter((it) => it.path === row.dataset.item), on);
       row.classList.toggle("is-on", on);
-      renderBrowserState();
+      renderTreeState();
     });
 
-    $("#br-crumbs").addEventListener("click", (event) => {
+    $("#tree-crumbs").addEventListener("click", (event) => {
       const button = event.target.closest("button[data-to]");
       if (!button) return;
-      browser.dir = button.dataset.to;
-      renderBrowser();
+      tree.dir = button.dataset.to;
+      renderTree();
     });
 
-    $("#br-filter").addEventListener("input", (event) => {
-      browser.filter = event.target.value;
-      renderBrowser();
+    $("#tree-filter").addEventListener("input", (event) => {
+      tree.filter = event.target.value;
+      renderTree();
     });
 
-    $("#br-all").addEventListener("change", (event) => {
-      pick(visibleFiles().map((f) => f.name), event.target.checked);
-      $("#br-list").innerHTML = browserRowsHTML();
-      renderBrowserState();
+    $("#tree-all").addEventListener("change", (event) => {
+      treePick(treeVisible(), event.target.checked);
+      $("#tree-list").innerHTML = treeRowsHTML();
+      renderTreeState();
     });
 
-    renderBrowser();
+    renderTree();
   }
 
   async function pruneSelected(repoId, repoType) {
-    const picked = selectedFilesLocal();
+    const picked = treePicked();
     if (!picked.length) return;
-    const rest = browser.files.length - picked.length;
+    const rest = tree.items.length - picked.length;
     const consequence = rest === 0
       ? `That is every file — ${repoId} leaves the library.`
       : `An update then fetches the remaining ${fmtNum(rest)} files only, never these again.`;
-    if (!confirm(`Delete ${fmtNum(picked.length)} file(s) from ${repoId}?\n\nThis frees ${fmtBytes(sumSize(picked))} and cannot be undone.\n${consequence}`)) return;
+    if (!confirm(`Delete ${fmtNum(picked.length)} file(s) from ${repoId}?\n\nThis frees ${fmtBytes(treeSize(picked))} and cannot be undone.\n${consequence}`)) return;
 
     try {
       const res = await api("/api/library/files/delete", {
         method: "POST",
-        body: { repo_id: repoId, repo_type: repoType, files: picked.map((f) => f.name) },
+        body: { repo_id: repoId, repo_type: repoType, files: treeFiles() },
       });
       // The last update check counted files that are no longer there.
       delete state.updates[`${repoType}:${repoId}`];
@@ -961,118 +983,6 @@
       if (res.removed_repo) { closeSheet(); return; }
       openLocalSheet(repoId, repoType);
     } catch (err) { fail(err); }
-  }
-
-  /* ------------------------------------------------------------ Picking files */
-
-  // Files split across parts (model-00001-of-00004.safetensors, a GGUF quant in
-  // several pieces) belong together — ticked individually they would be useless.
-  const SHARD_RE = /^(.*?)[-_]?(\d{5})-of-(\d{5})(\.[A-Za-z0-9]+)$/;
-
-  function groupFiles(files) {
-    const groups = new Map();
-    for (const file of files) {
-      const match = file.name.match(SHARD_RE);
-      const key = match ? `${match[1]}|${match[3]}|${match[4]}` : file.name;
-      if (!groups.has(key)) {
-        groups.set(key, {
-          key,
-          label: match ? `${match[1]}${match[4]}` : file.name,
-          names: [],
-          size: 0,
-        });
-      }
-      const group = groups.get(key);
-      group.names.push(file.name);
-      group.size += file.size;
-    }
-    return [...groups.values()];
-  }
-
-  const picker = { groups: [], selected: new Set(), total: 0 };
-
-  function pickerRowsHTML(filter = "") {
-    const needle = filter.trim().toLowerCase();
-    const rows = picker.groups.filter((g) => !needle || g.label.toLowerCase().includes(needle));
-    if (!rows.length) return `<div class="file-row"><span>No file matches that filter.</span><span></span></div>`;
-    return rows.map((group) => `
-      <label class="file-row is-pick ${picker.selected.has(group.key) ? "is-on" : ""}" data-key="${esc(group.key)}">
-        <input type="checkbox" ${picker.selected.has(group.key) ? "checked" : ""}>
-        ${fileLabelHTML(group.label)}
-        ${group.names.length > 1 ? `<span class="parts">${group.names.length} parts</span>` : ""}
-        <span class="file-size">${fmtBytes(group.size)}</span>
-      </label>`).join("");
-  }
-
-  function selectedFiles() {
-    return picker.groups.filter((g) => picker.selected.has(g.key)).flatMap((g) => g.names);
-  }
-
-  function selectedSize() {
-    return picker.groups.filter((g) => picker.selected.has(g.key)).reduce((sum, g) => sum + g.size, 0);
-  }
-
-  function renderPickerState() {
-    const count = selectedFiles().length;
-    const size = count ? selectedSize() : picker.total;
-    const button = $("#sheet-download");
-    if (button) {
-      button.textContent = count
-        ? `Download ${fmtNum(count)} file${count === 1 ? "" : "s"} · ${fmtBytes(size)}`
-        : `Download everything · ${fmtBytes(picker.total)}`;
-    }
-    const summary = $("#pick-summary");
-    if (summary) {
-      summary.textContent = count
-        ? `${fmtNum(count)} of ${fmtNum(picker.groups.reduce((n, g) => n + g.names.length, 0))} files · ${fmtBytes(size)}`
-        : "Nothing picked — the whole repo comes down.";
-    }
-    const all = $("#pick-all");
-    if (all) {
-      all.checked = picker.selected.size === picker.groups.length && picker.groups.length > 0;
-      all.indeterminate = picker.selected.size > 0 && picker.selected.size < picker.groups.length;
-    }
-  }
-
-  function filePickerHTML(files) {
-    picker.groups = groupFiles(files);
-    picker.selected = new Set();
-    picker.total = files.reduce((sum, f) => sum + f.size, 0);
-    return `
-      <div>
-        <div class="picker-head">
-          <label class="check"><input type="checkbox" id="pick-all"> <span>Select all</span></label>
-          <input class="field field-sm" id="pick-filter" placeholder="Filter, e.g. Q4_K_M" autocomplete="off">
-        </div>
-        <div class="file-list" id="pick-list">${pickerRowsHTML()}</div>
-        <p class="hint" id="pick-summary"></p>
-      </div>`;
-  }
-
-  function wirePicker() {
-    const list = $("#pick-list");
-    if (!list) return;
-
-    list.addEventListener("change", (event) => {
-      const row = event.target.closest(".file-row[data-key]");
-      if (!row) return;
-      const key = row.dataset.key;
-      if (event.target.checked) picker.selected.add(key); else picker.selected.delete(key);
-      row.classList.toggle("is-on", event.target.checked);
-      renderPickerState();
-    });
-
-    $("#pick-all").addEventListener("change", (event) => {
-      picker.selected = event.target.checked ? new Set(picker.groups.map((g) => g.key)) : new Set();
-      list.innerHTML = pickerRowsHTML($("#pick-filter").value);
-      renderPickerState();
-    });
-
-    $("#pick-filter").addEventListener("input", (event) => {
-      list.innerHTML = pickerRowsHTML(event.target.value);
-    });
-
-    renderPickerState();
   }
 
   async function openHubSheet(repoId, repoType) {
@@ -1101,7 +1011,8 @@
       </div>
       <div class="sheet-section">
         <h3>Pick files</h3>
-        ${filePickerHTML(info.files)}
+        <p class="hint">Open a folder to look inside. Tick nothing and the whole repo comes down.</p>
+        ${treeHTML(groupFiles(info.files), splitId(repoId).name)}
       </div>
       <div class="sheet-section">
         <h3>Options</h3>
@@ -1118,12 +1029,24 @@
       <span class="spacer"></span>
       <button class="btn" data-close>Close</button>`;
 
-    wirePicker();
+    // Nothing ticked means the whole repo, so both the button and the summary
+    // have to say which of the two is about to happen.
+    wireTree(() => {
+      const picked = treePicked();
+      const count = treeCount(picked);
+      const size = count ? treeSize(picked) : info.total_size;
+      $("#sheet-download").textContent = count
+        ? `Download ${fmtNum(count)} file${count === 1 ? "" : "s"} · ${fmtBytes(size)}`
+        : `Download everything · ${fmtBytes(info.total_size)}`;
+      $("#tree-summary").textContent = count
+        ? `${fmtNum(count)} of ${fmtNum(treeCount(tree.items))} files · ${fmtBytes(size)}`
+        : "Nothing picked — the whole repo comes down.";
+    });
 
     $("#sheet-download").addEventListener("click", () => {
       startDownload(repoId, repoType, {
         revision: $("#sheet-rev").value.trim(),
-        files: selectedFiles(),
+        files: treeFiles(),
         allow_patterns: csv("#sheet-allow"),
         ignore_patterns: csv("#sheet-ignore"),
       });
@@ -1132,8 +1055,6 @@
 
   async function openLocalSheet(repoId, repoType) {
     state.sheet = { kind: "local", id: repoId };
-    browser.repoId = repoId;
-    browser.repoType = repoType;
     const repo = findRepo(repoId, repoType);
     const update = updateFor({ repo_id: repoId, repo_type: repoType });
     openSheet("Local", repoId, `<p class="hint">Reading the folder…</p>`, "");
@@ -1169,7 +1090,9 @@
       <div class="sheet-section">
         <h3>Files</h3>
         <p class="hint">Open a folder to look inside. Whatever you tick can be deleted — and an update stops fetching it.</p>
-        ${browserHTML(data)}
+        ${treeHTML(plainItems(data.files), splitId(repoId).name, data.truncated
+          ? `<p class="hint is-warn">Only the first ${fmtNum(data.files.length)} files are listed — this repo holds more, and the rest cannot be picked here.</p>`
+          : "")}
       </div>`;
 
     $("#sheet-foot").innerHTML = `
@@ -1183,7 +1106,15 @@
       <button class="btn btn-danger" id="sheet-prune" hidden></button>
       <button class="btn btn-danger" id="sheet-delete">Delete repo</button>`;
 
-    wireBrowser();
+    wireTree(() => {
+      const picked = treePicked();
+      $("#tree-summary").textContent = picked.length
+        ? `${fmtNum(picked.length)} of ${fmtNum(tree.items.length)} files selected · ${fmtBytes(treeSize(picked))}`
+        : `${fmtNum(tree.items.length)} files · ${fmtBytes(treeSize(tree.items))}`;
+      const button = $("#sheet-prune");
+      button.hidden = picked.length === 0;
+      button.textContent = `Delete ${fmtNum(picked.length)} file${picked.length === 1 ? "" : "s"} · ${fmtBytes(treeSize(picked))}`;
+    });
 
     // Both labels do the same thing: re-fetch exactly what is recorded for
     // this copy. The server reads that off the marker, so no selection travels
