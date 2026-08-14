@@ -55,6 +55,7 @@
   }
 
   const fmtNum = (n) => new Intl.NumberFormat("en-GB").format(Number(n) || 0);
+  const fmtFiles = (n) => `${fmtNum(n)} ${n === 1 ? "file" : "files"}`;
   const shortSha = (sha) => String(sha || "").slice(0, 7);
   const csv = (sel) => $(sel).value.split(",").map((s) => s.trim()).filter(Boolean);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -837,7 +838,7 @@
     <div class="file-row is-pick is-dir" data-dir="${esc(entry.path)}">
       <input type="checkbox">
       <span class="file-name"><span class="base">${esc(entry.label)}/</span></span>
-      <span class="parts">${fmtNum(entry.files)} ${entry.files === 1 ? "file" : "files"}</span>
+      <span class="parts">${fmtFiles(entry.files)}</span>
       <span class="file-size">${fmtBytes(entry.size)}</span>
       <span class="go" aria-hidden="true">›</span>
     </div>`;
@@ -969,11 +970,11 @@
   async function pruneSelected(repoId, repoType) {
     const picked = treePicked();
     if (!picked.length) return;
-    const rest = tree.items.length - picked.length;
+    const rest = treeCount(tree.items) - treeCount(picked);
     const consequence = rest === 0
       ? `That is every file — ${repoId} leaves the library.`
       : `An update then fetches the remaining ${fmtNum(rest)} files only, never these again.`;
-    if (!confirm(`Delete ${fmtNum(picked.length)} file(s) from ${repoId}?\n\nThis frees ${fmtBytes(treeSize(picked))} and cannot be undone.\n${consequence}`)) return;
+    if (!confirm(`Delete ${fmtFiles(treeCount(picked))} from ${repoId}?\n\nThis frees ${fmtBytes(treeSize(picked))} and cannot be undone.\n${consequence}`)) return;
 
     try {
       const res = await api("/api/library/files/delete", {
@@ -1046,10 +1047,10 @@
       const count = treeCount(picked);
       const size = count ? treeSize(picked) : info.total_size;
       $("#sheet-download").textContent = count
-        ? `Download ${fmtNum(count)} file${count === 1 ? "" : "s"} · ${fmtBytes(size)}`
+        ? `Download ${fmtFiles(count)} · ${fmtBytes(size)}`
         : `Download everything · ${fmtBytes(info.total_size)}`;
       $("#tree-summary").textContent = count
-        ? `${fmtNum(count)} of ${fmtNum(treeCount(tree.items))} files · ${fmtBytes(size)}`
+        ? `${fmtNum(count)} of ${fmtFiles(treeCount(tree.items))} · ${fmtBytes(size)}`
         : "Nothing picked — the whole repo comes down.";
     });
 
@@ -1118,12 +1119,14 @@
 
     wireTree(() => {
       const picked = treePicked();
-      $("#tree-summary").textContent = picked.length
-        ? `${fmtNum(picked.length)} of ${fmtNum(tree.items.length)} files selected · ${fmtBytes(treeSize(picked))}`
-        : `${fmtNum(tree.items.length)} files · ${fmtBytes(treeSize(tree.items))}`;
+      const count = treeCount(picked);
+      const size = fmtBytes(treeSize(picked));
+      $("#tree-summary").textContent = count
+        ? `${fmtNum(count)} of ${fmtFiles(treeCount(tree.items))} selected · ${size}`
+        : `${fmtFiles(treeCount(tree.items))} · ${fmtBytes(treeSize(tree.items))}`;
       const button = $("#sheet-prune");
-      button.hidden = picked.length === 0;
-      button.textContent = `Delete ${fmtNum(picked.length)} file${picked.length === 1 ? "" : "s"} · ${fmtBytes(treeSize(picked))}`;
+      button.hidden = count === 0;
+      button.textContent = `Delete ${fmtFiles(count)} · ${size}`;
     });
 
     // Both labels do the same thing: re-fetch exactly what is recorded for
