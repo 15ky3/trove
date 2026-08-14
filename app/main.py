@@ -148,6 +148,13 @@ class DeleteBody(BaseModel):
     repo_type: str = "model"
 
 
+class FilesDeleteBody(BaseModel):
+    repo_id: str
+    repo_type: str = "model"
+    # Repo-relative names, exactly as the file listing reports them.
+    files: list[str] = Field(default_factory=list)
+
+
 class UpdateBody(BaseModel):
     repo_id: str = ""
     repo_type: str = "model"
@@ -280,6 +287,12 @@ async def library(
     return {"repos": repos, "data_dir": str(DATA_DIR)}
 
 
+# How many files one listing carries. The interface browses and deletes on this
+# list, so it is generous — but a repo can always hold more, and pretending
+# otherwise would let files be edited that were never shown.
+FILE_LIST_LIMIT = 5000
+
+
 @app.get("/api/library/files", dependencies=[Depends(require_auth)])
 async def library_files(
     repo_id: str,
@@ -287,8 +300,12 @@ async def library_files(
 ) -> dict[str, Any]:
     if not valid_repo_id(repo_id):
         raise HTTPException(status_code=400, detail="Invalid repo ID")
-    files = await asyncio.to_thread(storage.repo_files, repo_type, repo_id)
-    return {"files": files, "path": str(local_dir_for(repo_type, repo_id))}
+    files = await asyncio.to_thread(storage.repo_files, repo_type, repo_id, FILE_LIST_LIMIT + 1)
+    return {
+        "files": files[:FILE_LIST_LIMIT],
+        "truncated": len(files) > FILE_LIST_LIMIT,
+        "path": str(local_dir_for(repo_type, repo_id)),
+    }
 
 
 # How many repos to ask the Hub about at once. The check is one API call per
@@ -422,6 +439,36 @@ async def library_update(body: UpdateBody) -> dict[str, Any]:
     if not body.all_outdated and not queued:
         raise HTTPException(status_code=409, detail=f"{body.repo_id} is already queued")
     return {"queued": queued, "skipped": skipped}
+
+
+@app.post("/api/library/files/delete", dependencies=[Depends(require_auth)])
+async def library_delete_files(body: FilesDeleteBody) -> dict[str, Any]:
+    if not valid_repo_id(body.repo_id):
+        raise HTTPException(status_code=400, detail="Invalid repo ID")
+    if body.repo_type not in REPO_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid repo type")
+    names = [name for name in body.files if name.strip()]
+    if not names:
+        raise HTTPException(status_code=400, detail="No files given")
+    # A transfer writes into this very folder; taking files out from under it
+    # would either be undone straight away or break the run.
+    if _download_active(body.repo_id, body.repo_type):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{body.repo_id} is being transferred — try again once that finished",
+        )
+
+    try:
+        result = await asyncio.to_thread(storage.delete_files, body.repo_type, body.repo_id, names)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {exc}") from exc
+
+    await ws_hub.broadcast({"type": "library"})
+    return result
 
 
 @app.post("/api/library/delete", dependencies=[Depends(require_auth)])

@@ -6,8 +6,8 @@ import json
 import os
 import shutil
 import time
-from pathlib import Path
-from typing import Any, Iterator
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable, Iterator
 
 from .config import (
     DATA_DIR,
@@ -155,24 +155,27 @@ def list_repos(repo_type: str | None = None, refresh: bool = False) -> list[dict
     return out
 
 
-def repo_files(repo_type: str, repo_id: str, limit: int = 2000) -> list[dict[str, Any]]:
-    path = local_dir_for(repo_type, repo_id)
-    if not path.is_dir():
-        return []
-    out: list[dict[str, Any]] = []
+def _iter_content_files(path: Path) -> Iterator[Path]:
+    """Every file that belongs to the repo itself — no bookkeeping, no marker."""
     for root, dirnames, filenames in os.walk(path, onerror=lambda _e: None):
         dirnames[:] = [d for d in dirnames if d not in _INTERNAL]
         for name in filenames:
             if name == MARKER_NAME or name in LEGACY_MARKER_NAMES:
                 continue
-            full = Path(root) / name
-            try:
-                stat = full.stat()
-            except OSError:
-                continue
-            out.append({"name": full.relative_to(path).as_posix(), "size": stat.st_size})
-            if len(out) >= limit:
-                break
+            yield Path(root) / name
+
+
+def repo_files(repo_type: str, repo_id: str, limit: int = 2000) -> list[dict[str, Any]]:
+    path = local_dir_for(repo_type, repo_id)
+    if not path.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for full in _iter_content_files(path):
+        try:
+            stat = full.stat()
+        except OSError:
+            continue
+        out.append({"name": full.relative_to(path).as_posix(), "size": stat.st_size})
         if len(out) >= limit:
             break
     out.sort(key=lambda f: f["name"])
@@ -248,6 +251,155 @@ def drop_leftover_parts(path: Path) -> tuple[int, int]:
     if count:
         invalidate(path)
     return total, count
+
+
+def _safe_member(path: Path, name: str) -> Path:
+    """Resolve a repo-relative file name, refusing anything that leaves the repo.
+
+    The names come from the interface, so they are treated as hostile: a `..`
+    segment, an absolute path or a symlink pointing outside would otherwise
+    delete files anywhere on the host.
+    """
+    clean = (name or "").strip().replace("\\", "/")
+    if not clean or clean.startswith("/"):
+        raise ValueError(f"Invalid file name: {name!r}")
+
+    parts = PurePosixPath(clean).parts
+    if ".." in parts:
+        raise ValueError(f"Invalid file name: {name!r}")
+    if parts[0] in _INTERNAL:
+        raise ValueError(f"{parts[0]} holds bookkeeping, not repo content")
+    if parts[-1] == MARKER_NAME or parts[-1] in LEGACY_MARKER_NAMES:
+        raise ValueError("The download record cannot be deleted on its own")
+
+    target = path / clean
+    try:
+        resolved = target.resolve()
+        root = path.resolve()
+    except OSError as exc:
+        raise ValueError(f"Invalid file name: {name!r}") from exc
+    if root not in resolved.parents:
+        raise ValueError(f"{name!r} points outside the repo")
+    return target
+
+
+def _iter_bookkeeping(cache_path: Path) -> Iterator[Path]:
+    """The `.metadata` record and any `.incomplete` part of one file."""
+    meta = cache_path.with_name(f"{cache_path.name}.metadata")
+    if meta.is_file():
+        yield meta
+    prefix = f"{cache_path.name}."
+    try:
+        with os.scandir(cache_path.parent) as entries:
+            for entry in entries:
+                if entry.name.startswith(prefix) and entry.name.endswith(".incomplete"):
+                    yield Path(entry.path)
+    except OSError:
+        return
+
+
+def _drop_bookkeeping(path: Path, name: str) -> int:
+    """Forget a file was ever downloaded, and report the bytes that frees.
+
+    The `.metadata` next to the download cache is what the update check reads:
+    left behind, a deleted file still counts as tracked and the next update
+    fetches it again.
+    """
+    cache_root = _download_cache(path)
+    cache_path = cache_root / name
+    freed = 0
+    for extra in list(_iter_bookkeeping(cache_path)):
+        try:
+            size = extra.stat().st_size
+            extra.unlink()
+        except OSError:
+            continue
+        freed += size
+    _prune_empty_dirs(cache_path.parent, cache_root)
+    return freed
+
+
+def _prune_empty_dirs(start: Path, stop: Path) -> None:
+    """Remove folders a deletion left behind, up to but excluding `stop`."""
+    current = start
+    while current != stop and stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def _narrow_marker(path: Path, remaining: list[str]) -> None:
+    """Record what is left as the selection for this copy.
+
+    An update re-fetches exactly what the marker names, so a file deleted here
+    has to leave the selection as well — otherwise the next update pulls it
+    straight back. A pattern used at download time goes: it would widen the
+    selection to everything it once matched, deleted files included.
+
+    A folder without a marker keeps not having one. Writing the first one here
+    would dress an unknown folder up as a tracked download.
+    """
+    marker = _read_marker(path)
+    if not marker:
+        return
+    marker["files"] = remaining
+    marker["allow_patterns"] = []
+    (path / MARKER_NAME).write_text(json.dumps(marker, indent=2))
+
+
+def delete_files(repo_type: str, repo_id: str, names: Iterable[str]) -> dict[str, Any]:
+    """Delete picked files from a stored repo and narrow it to what is left."""
+    path = local_dir_for(repo_type, repo_id)
+    if not path.is_dir():
+        raise FileNotFoundError(f"{repo_id} is not stored locally")
+
+    # Validate every name before deleting anything: a bad one in the middle
+    # would otherwise leave the repo half edited.
+    targets = [(name, _safe_member(path, name)) for name in names]
+
+    freed = 0
+    deleted: list[str] = []
+    missing: list[str] = []
+    for name, target in targets:
+        if not target.is_file():
+            # Someone else got there first, or the interface is showing a
+            # listing that has since moved on.
+            missing.append(name)
+            continue
+        size = target.stat().st_size
+        target.unlink()
+        deleted.append(name)
+        freed += size + _drop_bookkeeping(path, target.relative_to(path).as_posix())
+        _prune_empty_dirs(target.parent, path)
+
+    invalidate(path)
+    remaining = sorted(p.relative_to(path).as_posix() for p in _iter_content_files(path))
+    result: dict[str, Any] = {
+        "deleted": deleted,
+        "missing": missing,
+        "freed": freed,
+        "remaining": len(remaining),
+        "removed_repo": False,
+        "warning": "",
+    }
+
+    if not remaining:
+        # Nothing worth keeping the folder for — and an empty selection reads as
+        # "the whole repo" on the next update, which is the opposite of what
+        # emptying it out asked for.
+        result["freed"] += delete_repo(repo_type, repo_id)["freed"]
+        result["removed_repo"] = True
+        return result
+
+    try:
+        _narrow_marker(path, remaining)
+    except OSError as exc:
+        # The files are gone either way; say so rather than failing the call,
+        # but do not let the stale selection pass unmentioned.
+        result["warning"] = f"Deleted, but the download record could not be updated ({exc}). An update may fetch them again."
+    return result
 
 
 def delete_repo(repo_type: str, repo_id: str) -> dict[str, Any]:

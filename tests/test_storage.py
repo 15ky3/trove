@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -182,6 +183,165 @@ class TestRepoFiles:
     def test_limit_is_honoured(self, repo_factory):
         repo_factory("org/name", files={f"f{i}.bin": 1 for i in range(20)})
         assert len(storage.repo_files("model", "org/name", limit=5)) == 5
+
+
+class TestDeleteFiles:
+    def test_removes_the_picked_file_only(self, repo_factory):
+        path = repo_factory("org/name", files={"a.bin": 100, "b.bin": 50}, marker={"commit": "abc"})
+        result = storage.delete_files("model", "org/name", ["a.bin"])
+        assert not (path / "a.bin").exists()
+        assert (path / "b.bin").exists()
+        assert result["deleted"] == ["a.bin"]
+        assert result["freed"] == 100
+        assert result["remaining"] == 1
+
+    def test_the_download_record_goes_too(self, repo_factory):
+        # Left behind, the update check would still count the file as tracked
+        # and pull it straight back.
+        repo_factory(
+            "org/name",
+            files={"a.bin": 10, "b.bin": 10},
+            marker={"commit": "abc"},
+            etags={"a.bin": "sha-a", "b.bin": "sha-b"},
+        )
+        storage.delete_files("model", "org/name", ["a.bin"])
+        assert storage.local_etags("model", "org/name") == {"b.bin": "sha-b"}
+
+    @pytest.mark.parametrize("part", ["a.bin.incomplete", "a.bin.deadbeef.0123-4567.incomplete"])
+    def test_half_written_parts_of_that_file_go_too(self, repo_factory, part):
+        path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 10}, marker={"commit": "abc"})
+        cache = path / ".cache" / "huggingface" / "download"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / part).write_bytes(b"y" * 400)
+        result = storage.delete_files("model", "org/name", ["a.bin"])
+        assert not (cache / part).exists()
+        assert result["freed"] == 410
+
+    def test_parts_of_another_file_stay(self, repo_factory):
+        path = repo_factory(
+            "org/name",
+            files={"a.bin": 10, "b.bin": 10},
+            marker={"commit": "abc"},
+            leftovers={"b.bin": 400},
+        )
+        storage.delete_files("model", "org/name", ["a.bin"])
+        assert storage.leftover_size(path) == 400
+
+    def test_an_emptied_folder_is_removed(self, repo_factory):
+        path = repo_factory("org/name", files={"onnx/model.onnx": 10, "a.bin": 10}, marker={"commit": "abc"})
+        storage.delete_files("model", "org/name", ["onnx/model.onnx"])
+        assert not (path / "onnx").exists()
+        assert path.is_dir()
+
+    def test_the_selection_narrows_to_what_is_left(self, repo_factory):
+        path = repo_factory(
+            "org/name",
+            files={"a.bin": 10, "sub/b.bin": 10, "c.bin": 10},
+            marker={"commit": "abc"},
+        )
+        storage.delete_files("model", "org/name", ["a.bin"])
+        marker = json.loads((path / config.MARKER_NAME).read_text())
+        assert marker["files"] == ["c.bin", "sub/b.bin"]
+        # The repo now counts as a partial copy, so the update goes file by file.
+        assert storage.list_repos()[0]["partial"] is True
+
+    def test_a_download_pattern_is_dropped(self, repo_factory):
+        # "*.gguf" would match the deleted file again on the next update.
+        path = repo_factory(
+            "org/name",
+            files={"q4.gguf": 10, "q8.gguf": 10},
+            marker={"commit": "abc", "allow_patterns": ["*.gguf"]},
+        )
+        storage.delete_files("model", "org/name", ["q8.gguf"])
+        marker = json.loads((path / config.MARKER_NAME).read_text())
+        assert marker["allow_patterns"] == []
+        assert marker["files"] == ["q4.gguf"]
+
+    def test_a_folder_without_a_record_does_not_get_one(self, repo_factory):
+        # Inventing a marker here would dress an unknown folder up as a
+        # tracked download.
+        path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 10})
+        storage.delete_files("model", "org/name", ["a.bin"])
+        assert not (path / config.MARKER_NAME).exists()
+        assert storage.list_repos()[0]["complete"] is False
+
+    def test_deleting_the_last_file_removes_the_repo(self, repo_factory):
+        path = repo_factory("org/name", files={"a.bin": 100}, marker={"commit": "abc"})
+        result = storage.delete_files("model", "org/name", ["a.bin"])
+        assert result["removed_repo"] is True
+        assert not path.exists()
+        assert storage.list_repos() == []
+
+    def test_a_file_that_is_already_gone_is_reported_not_raised(self, repo_factory):
+        repo_factory("org/name", files={"a.bin": 10, "b.bin": 10})
+        result = storage.delete_files("model", "org/name", ["absent.bin"])
+        assert result == {
+            "deleted": [], "missing": ["absent.bin"], "freed": 0,
+            "remaining": 2, "removed_repo": False, "warning": "",
+        }
+
+    def test_several_at_once(self, repo_factory):
+        path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 20, "c.bin": 30})
+        result = storage.delete_files("model", "org/name", ["a.bin", "c.bin"])
+        assert result["freed"] == 40
+        assert [f["name"] for f in storage.repo_files("model", "org/name")] == ["b.bin"]
+        assert path.is_dir()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "../../../etc/passwd",
+            "sub/../../escape.bin",
+            "/etc/passwd",
+            "..",
+            "",
+            "   ",
+            ".cache/huggingface/download/a.bin.metadata",
+            ".git/config",
+            config.MARKER_NAME,
+            "..\\..\\escape.bin",
+        ],
+    )
+    def test_traversal_and_bookkeeping_are_refused(self, repo_factory, name):
+        repo_factory("org/name", files={"a.bin": 10})
+        with pytest.raises(ValueError):
+            storage.delete_files("model", "org/name", [name])
+
+    def test_a_symlink_out_of_the_repo_is_refused(self, repo_factory, tmp_path):
+        path = repo_factory("org/name", files={"a.bin": 10})
+        outside = tmp_path / "secret.txt"
+        outside.write_text("keep me")
+        (path / "link.bin").symlink_to(outside)
+        with pytest.raises(ValueError):
+            storage.delete_files("model", "org/name", ["link.bin"])
+        assert outside.exists()
+
+    def test_one_bad_name_deletes_nothing(self, repo_factory):
+        path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 10})
+        with pytest.raises(ValueError):
+            storage.delete_files("model", "org/name", ["a.bin", "../escape"])
+        assert (path / "a.bin").exists()
+
+    def test_an_unknown_repo_raises(self):
+        with pytest.raises(FileNotFoundError):
+            storage.delete_files("model", "org/absent", ["a.bin"])
+
+    def test_an_unwritable_marker_is_a_warning_not_a_failure(self, repo_factory, monkeypatch):
+        path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 10}, marker={"commit": "abc"})
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(storage.Path, "write_text", refuse)
+        result = storage.delete_files("model", "org/name", ["a.bin"])
+        assert not (path / "a.bin").exists()
+        assert "could not be updated" in result["warning"]
+
+    def test_sizes_are_recounted_afterwards(self, repo_factory):
+        repo_factory("org/name", files={"a.bin": 100, "b.bin": 50})
+        assert storage.list_repos()[0]["size"] == 150
+        storage.delete_files("model", "org/name", ["a.bin"])
+        assert storage.list_repos()[0]["size"] == 50
 
 
 class TestDelete:
