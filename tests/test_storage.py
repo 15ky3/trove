@@ -409,6 +409,13 @@ class TestDelete:
         storage.delete_repo("model", "org/one")
         assert path.parent.is_dir()
 
+    def test_the_type_root_itself_is_never_removed(self, repo_factory):
+        # A repo without an org sits directly in the root, so the cleanup above
+        # it must stop there instead of taking the root with it.
+        repo_factory("gpt2")
+        storage.delete_repo("model", "gpt2")
+        assert config.type_root("model").is_dir()
+
     def test_unknown_repo_raises(self):
         with pytest.raises(FileNotFoundError):
             storage.delete_repo("model", "org/absent")

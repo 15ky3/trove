@@ -450,14 +450,10 @@ def delete_repo(repo_type: str, repo_id: str) -> dict[str, Any]:
     shutil.rmtree(path)
     invalidate(path)
 
-    # Clean up an org folder left empty, so the library stays tidy.
-    parent = path.parent
-    root = type_root(repo_type)
-    if parent != root and parent.is_dir() and not any(parent.iterdir()):
-        try:
-            parent.rmdir()
-        except OSError:
-            pass
+    # Clean up an org folder left empty, so the library stays tidy. Resolved,
+    # because `local_dir_for` resolves and a symlinked DATA_DIR would otherwise
+    # make the two paths disagree.
+    _prune_empty_dirs(path.parent, type_root(repo_type).resolve())
 
     return {"deleted": str(path), "freed": size + leftover, "files": files}
 
