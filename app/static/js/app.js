@@ -739,7 +739,8 @@
     items: [],
     dir: "",
     filter: "",
-    selected: new Set(),   // item paths
+    selected: new Set(),   // item keys
+    shown: [],             // the items the current rows cover
     root: "",              // label of the first crumb
     onChange: () => {},
   };
@@ -757,7 +758,7 @@
       // The leading path stays in the label, so the group sits in its folder.
       const path = match ? `${match[1]}${match[4]}` : file.name;
       const key = match ? `${match[1]}|${match[3]}|${match[4]}` : file.name;
-      if (!groups.has(key)) groups.set(key, { path, names: [], size: 0 });
+      if (!groups.has(key)) groups.set(key, { key, path, names: [], size: 0 });
       const group = groups.get(key);
       group.names.push(file.name);
       group.size += file.size;
@@ -765,7 +766,7 @@
     return [...groups.values()];
   }
 
-  const plainItems = (files) => files.map((f) => ({ path: f.name, names: [f.name], size: f.size }));
+  const plainItems = (files) => files.map((f) => ({ key: f.name, path: f.name, names: [f.name], size: f.size }));
 
   const treeUnder = (dir) => tree.items.filter((it) => it.path.startsWith(dir ? `${dir}/` : ""));
 
@@ -812,19 +813,19 @@
     };
   }
 
-  const treePicked = () => tree.items.filter((it) => tree.selected.has(it.path));
+  const treePicked = () => tree.items.filter((it) => tree.selected.has(it.key));
   const treeFiles = () => treePicked().flatMap((it) => it.names);
   const treeCount = (items) => items.reduce((sum, it) => sum + it.names.length, 0);
   const treeSize = (items) => items.reduce((sum, it) => sum + it.size, 0);
 
   function treePick(items, on) {
-    items.forEach((item) => (on ? tree.selected.add(item.path) : tree.selected.delete(item.path)));
+    items.forEach((item) => (on ? tree.selected.add(item.key) : tree.selected.delete(item.key)));
   }
 
   function treeLeafHTML(item, label) {
-    const on = tree.selected.has(item.path);
+    const on = tree.selected.has(item.key);
     return `
-      <label class="file-row is-pick ${on ? "is-on" : ""}" data-item="${esc(item.path)}">
+      <label class="file-row is-pick ${on ? "is-on" : ""}" data-item="${esc(item.key)}">
         <input type="checkbox" ${on ? "checked" : ""}>
         ${fileLabelHTML(label)}
         ${item.names.length > 1 ? `<span class="parts">${item.names.length} parts</span>` : ""}
@@ -846,17 +847,24 @@
   const treeMoreHTML = (hidden, where) =>
     treeNoteHTML(`… ${fmtNum(hidden)} more ${where} — narrow it down with the filter.`);
 
+  // Also records what the rows actually cover, because "All shown" has to mean
+  // shown: a long list is cut at TREE_LIMIT, and a tick box that quietly
+  // reaches past the cut would arm a delete over rows nobody saw.
   function treeRowsHTML() {
     if (tree.filter.trim()) {
       const hits = treeVisible();
+      tree.shown = hits.slice(0, TREE_LIMIT);
       if (!hits.length) return treeNoteHTML("Nothing matches that filter.");
-      return hits.slice(0, TREE_LIMIT).map((it) => treeLeafHTML(it, it.path)).join("")
+      return tree.shown.map((it) => treeLeafHTML(it, it.path)).join("")
         + (hits.length > TREE_LIMIT ? treeMoreHTML(hits.length - TREE_LIMIT, "matching") : "");
     }
     const { dirs, leaves } = treeEntries();
+    const here = leaves.slice(0, TREE_LIMIT);
+    // Folders are never cut, so everything beneath a listed one counts as shown.
+    tree.shown = [...dirs.flatMap((d) => treeUnder(d.path)), ...here.map((e) => e.item)];
     if (!dirs.length && !leaves.length) return treeNoteHTML("This folder is empty.");
     return dirs.map(treeDirHTML).join("")
-      + leaves.slice(0, TREE_LIMIT).map((e) => treeLeafHTML(e.item, e.label)).join("")
+      + here.map((e) => treeLeafHTML(e.item, e.label)).join("")
       + (leaves.length > TREE_LIMIT ? treeMoreHTML(leaves.length - TREE_LIMIT, "in this folder") : "");
   }
 
@@ -872,10 +880,10 @@
 
   // A tick box cannot express "some of it" in markup, only in script.
   function paintTreeTicks() {
-    const boxes = [[$("#tree-all"), treeVisible()]];
+    const boxes = [[$("#tree-all"), tree.shown]];
     $$("#tree-list .file-row[data-dir]").forEach((row) => boxes.push([$("input", row), treeUnder(row.dataset.dir)]));
     boxes.forEach(([box, items]) => {
-      const on = items.filter((it) => tree.selected.has(it.path)).length;
+      const on = items.filter((it) => tree.selected.has(it.key)).length;
       box.checked = items.length > 0 && on === items.length;
       box.indeterminate = on > 0 && on < items.length;
       box.closest(".file-row")?.classList.toggle("is-on", box.checked);
@@ -932,7 +940,7 @@
       const on = event.target.checked;
       treePick(row.dataset.dir !== undefined
         ? treeUnder(row.dataset.dir)
-        : tree.items.filter((it) => it.path === row.dataset.item), on);
+        : tree.items.filter((it) => it.key === row.dataset.item), on);
       row.classList.toggle("is-on", on);
       renderTreeState();
     });
@@ -950,7 +958,7 @@
     });
 
     $("#tree-all").addEventListener("change", (event) => {
-      treePick(treeVisible(), event.target.checked);
+      treePick(tree.shown, event.target.checked);
       $("#tree-list").innerHTML = treeRowsHTML();
       renderTreeState();
     });
@@ -981,7 +989,9 @@
       if (res.warning) toast(res.warning, "err", "Selection not updated");
       await Promise.all([loadLibrary(), loadDisk()]);
       if (res.removed_repo) { closeSheet(); return; }
-      openLocalSheet(repoId, repoType);
+      // The panel may have been closed while the request was in flight;
+      // re-reading it must not pull it back open.
+      if (state.sheet?.kind === "local" && state.sheet.id === repoId) openLocalSheet(repoId, repoType);
     } catch (err) { fail(err); }
   }
 
@@ -1091,7 +1101,7 @@
         <h3>Files</h3>
         <p class="hint">Open a folder to look inside. Whatever you tick can be deleted — and an update stops fetching it.</p>
         ${treeHTML(plainItems(data.files), splitId(repoId).name, data.truncated
-          ? `<p class="hint is-warn">Only the first ${fmtNum(data.files.length)} files are listed — this repo holds more, and the rest cannot be picked here.</p>`
+          ? `<p class="hint is-warn">Only ${fmtNum(data.files.length)} files are listed — this repo holds more, and the rest are neither shown nor deletable here.</p>`
           : "")}
       </div>`;
 
