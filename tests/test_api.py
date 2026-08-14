@@ -26,6 +26,7 @@ PROTECTED = [
     ("POST", "/api/settings/test-token"),
     ("POST", "/api/library/update"),
     ("POST", "/api/library/delete"),
+    ("POST", "/api/library/files/delete"),
     ("POST", "/api/jobs/download"),
     ("POST", "/api/jobs/upload"),
     ("POST", "/api/jobs/abc/cancel"),
@@ -222,6 +223,17 @@ class TestLibraryEndpoints:
     def test_files_rejects_a_bad_id(self, client):
         assert client.get("/api/library/files?repo_id=../etc").status_code == 400
 
+    def test_files_says_when_the_listing_was_cut(self, client, repo_factory, monkeypatch):
+        monkeypatch.setattr("app.main.FILE_LIST_LIMIT", 2)
+        repo_factory("org/name", files={f"f{i}.bin": 1 for i in range(5)})
+        body = client.get("/api/library/files?repo_id=org/name").json()
+        assert body["truncated"] is True
+        assert len(body["files"]) == 2
+
+    def test_files_is_not_marked_truncated_when_it_fits(self, client, repo_factory):
+        repo_factory("org/name", files={"a.bin": 1})
+        assert client.get("/api/library/files?repo_id=org/name").json()["truncated"] is False
+
     def test_delete_removes_it(self, client, repo_factory):
         repo_factory("org/name", files={"a.bin": 100})
         body = client.post("/api/library/delete", json={"repo_id": "org/name"}).json()
@@ -236,6 +248,88 @@ class TestLibraryEndpoints:
 
     def test_delete_rejects_a_bad_type(self, client):
         assert client.post("/api/library/delete", json={"repo_id": "a/b", "repo_type": "nope"}).status_code == 400
+
+
+class TestFileDeletion:
+    def test_deletes_the_picked_files(self, client, repo_factory):
+        repo_factory("org/name", files={"a.bin": 100, "b.bin": 50}, marker={"commit": "abc"})
+        body = client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "files": ["a.bin"]}
+        ).json()
+        assert body["deleted"] == ["a.bin"]
+        assert body["freed"] == 100
+        assert [f["name"] for f in storage.repo_files("model", "org/name")] == ["b.bin"]
+
+    def test_the_next_update_leaves_them_out(self, client, repo_factory, fake_hub):
+        repo_factory(
+            "org/name",
+            files={"a.bin": 10, "b.bin": 10},
+            marker={"commit": "abc"},
+            etags={"a.bin": "sha-a", "b.bin": "sha-b"},
+        )
+        fake_hub()
+        client.post("/api/library/files/delete", json={"repo_id": "org/name", "files": ["a.bin"]})
+        client.post("/api/library/update", json={"repo_id": "org/name"})
+        job = next(j for j in manager.jobs.values())
+        assert job.files == ["b.bin"]
+
+    def test_emptying_a_repo_removes_it(self, client, repo_factory):
+        repo_factory("org/name", files={"a.bin": 10}, marker={"commit": "abc"})
+        body = client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "files": ["a.bin"]}
+        ).json()
+        assert body["removed_repo"] is True
+        assert storage.list_repos() == []
+
+    def test_an_empty_list_is_a_400(self, client, repo_factory):
+        repo_factory("org/name")
+        assert client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "files": [" "]}
+        ).status_code == 400
+
+    @pytest.mark.parametrize(
+        "name",
+        ["../../etc/passwd", "/etc/passwd", ".cache/x", config.MARKER_NAME, ".", "./", ".TROVE.json"],
+    )
+    def test_traversal_is_a_400(self, client, repo_factory, name):
+        repo_factory("org/name", files={"a.bin": 10})
+        assert client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "files": [name]}
+        ).status_code == 400
+
+    def test_a_bad_id_is_a_400(self, client):
+        assert client.post(
+            "/api/library/files/delete", json={"repo_id": "../etc", "files": ["a.bin"]}
+        ).status_code == 400
+
+    def test_a_bad_type_is_a_400(self, client, repo_factory):
+        repo_factory("org/name")
+        assert client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "repo_type": "nope", "files": ["a.bin"]}
+        ).status_code == 400
+
+    def test_an_unknown_repo_is_a_404(self, client):
+        assert client.post(
+            "/api/library/files/delete", json={"repo_id": "org/absent", "files": ["a.bin"]}
+        ).status_code == 404
+
+    def test_a_repo_being_transferred_is_a_409(self, client, repo_factory, fake_hub):
+        # The transfer writes into that folder; pulling files out mid-run would
+        # either be undone straight away or break it.
+        repo_factory("org/name", files={"a.bin": 10}, marker={"commit": "old"})
+        fake_hub()
+        client.post("/api/library/update", json={"repo_id": "org/name"})
+        assert client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "files": ["a.bin"]}
+        ).status_code == 409
+
+    def test_a_file_already_gone_is_reported(self, client, repo_factory):
+        repo_factory("org/name", files={"a.bin": 10})
+        body = client.post(
+            "/api/library/files/delete", json={"repo_id": "org/name", "files": ["absent.bin"]}
+        ).json()
+        assert body["missing"] == ["absent.bin"]
+        assert body["deleted"] == []
 
 
 # ------------------------------------------------------------- Update checking
