@@ -273,12 +273,45 @@ class TestDeleteFiles:
         assert storage.list_repos() == []
 
     def test_a_file_that_is_already_gone_is_reported_not_raised(self, repo_factory):
-        repo_factory("org/name", files={"a.bin": 10, "b.bin": 10})
+        repo_factory("org/name", files={"a.bin": 10, "b.bin": 10}, marker={"commit": "abc"})
         result = storage.delete_files("model", "org/name", ["absent.bin"])
         assert result == {
-            "deleted": [], "missing": ["absent.bin"], "freed": 0,
+            "deleted": [], "missing": ["absent.bin"], "failed": [], "freed": 0,
             "remaining": 2, "removed_repo": False, "warning": "",
         }
+
+    def test_a_file_that_cannot_be_removed_does_not_abort_the_rest(self, repo_factory, monkeypatch):
+        # A Synology ACL or a read-only mount hits one file in the middle. The
+        # ones already gone stay gone, so the selection has to be narrowed
+        # anyway — otherwise the next update fetches them back.
+        path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 10, "c.bin": 10}, marker={"commit": "abc"})
+        real = storage.Path.unlink
+
+        def refuse(self, *args, **kwargs):
+            if self.name == "b.bin":
+                raise PermissionError("operation not permitted")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(storage.Path, "unlink", refuse)
+        result = storage.delete_files("model", "org/name", ["a.bin", "b.bin", "c.bin"])
+
+        assert result["deleted"] == ["a.bin", "c.bin"]
+        assert result["failed"] == ["b.bin"]
+        assert (path / "b.bin").exists()
+        assert "permissions" in result["warning"]
+        marker = json.loads((path / config.MARKER_NAME).read_text())
+        assert marker["files"] == ["b.bin"]
+
+    def test_a_copy_without_a_record_says_the_promise_does_not_hold(self, repo_factory):
+        # Nothing to narrow, so an update still fetches the whole repo. The
+        # interface promises the opposite, so this has to be said out loud.
+        repo_factory("org/name", files={"a.bin": 10, "b.bin": 10})
+        result = storage.delete_files("model", "org/name", ["a.bin"])
+        assert "no download record" in result["warning"]
+
+    def test_a_copy_with_a_record_warns_about_nothing(self, repo_factory):
+        repo_factory("org/name", files={"a.bin": 10, "b.bin": 10}, marker={"commit": "abc"})
+        assert storage.delete_files("model", "org/name", ["a.bin"])["warning"] == ""
 
     def test_several_at_once(self, repo_factory):
         path = repo_factory("org/name", files={"a.bin": 10, "b.bin": 20, "c.bin": 30})
@@ -296,10 +329,19 @@ class TestDeleteFiles:
             "..",
             "",
             "   ",
+            # These normalise away to no path at all — the guards below have
+            # nothing left to inspect.
+            ".",
+            "./",
+            ". ",
             ".cache/huggingface/download/a.bin.metadata",
             ".git/config",
             config.MARKER_NAME,
             "..\\..\\escape.bin",
+            # A case-insensitive volume would resolve these to the real thing.
+            ".Cache/huggingface/download/a.bin.metadata",
+            ".TROVE.json",
+            "sub/.TrOvE.json",
         ],
     )
     def test_traversal_and_bookkeeping_are_refused(self, repo_factory, name):

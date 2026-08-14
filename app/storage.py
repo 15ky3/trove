@@ -264,12 +264,16 @@ def _safe_member(path: Path, name: str) -> Path:
     if not clean or clean.startswith("/"):
         raise ValueError(f"Invalid file name: {name!r}")
 
+    # "." and "./" normalise away to no parts at all, so the checks below have
+    # nothing to look at — and an empty name is not a file either way.
     parts = PurePosixPath(clean).parts
-    if ".." in parts:
+    if not parts or ".." in parts:
         raise ValueError(f"Invalid file name: {name!r}")
-    if parts[0] in _INTERNAL:
+    # Case-folded: on a case-insensitive volume ".Cache/…" and ".TROVE.json"
+    # reach the very files these two lines exist to protect.
+    if parts[0].casefold() in _INTERNAL:
         raise ValueError(f"{parts[0]} holds bookkeeping, not repo content")
-    if parts[-1] == MARKER_NAME or parts[-1] in LEGACY_MARKER_NAMES:
+    if parts[-1].casefold() in (MARKER_NAME, *LEGACY_MARKER_NAMES):
         raise ValueError("The download record cannot be deleted on its own")
 
     target = path / clean
@@ -284,7 +288,13 @@ def _safe_member(path: Path, name: str) -> Path:
 
 
 def _iter_bookkeeping(cache_path: Path) -> Iterator[Path]:
-    """The `.metadata` record and any `.incomplete` part of one file."""
+    """The `.metadata` record and the `.incomplete` parts belonging to a file.
+
+    The part match is by prefix, so it also catches parts of files whose name
+    merely extends this one — deleting `model.safetensors` clears a leftover of
+    `model.safetensors.index.json` too. That costs nothing: a part file can
+    never be resumed, so every one of them is dead weight whoever wrote it.
+    """
     meta = cache_path.with_name(f"{cache_path.name}.metadata")
     if meta.is_file():
         yield meta
@@ -330,8 +340,8 @@ def _prune_empty_dirs(start: Path, stop: Path) -> None:
         current = current.parent
 
 
-def _narrow_marker(path: Path, remaining: list[str]) -> None:
-    """Record what is left as the selection for this copy.
+def _narrow_marker(path: Path, remaining: list[str]) -> bool:
+    """Record what is left as the selection for this copy; False if there is none.
 
     An update re-fetches exactly what the marker names, so a file deleted here
     has to leave the selection as well — otherwise the next update pulls it
@@ -343,10 +353,11 @@ def _narrow_marker(path: Path, remaining: list[str]) -> None:
     """
     marker = _read_marker(path)
     if not marker:
-        return
+        return False
     marker["files"] = remaining
     marker["allow_patterns"] = []
     (path / MARKER_NAME).write_text(json.dumps(marker, indent=2))
+    return True
 
 
 def delete_files(repo_type: str, repo_id: str, names: Iterable[str]) -> dict[str, Any]:
@@ -362,23 +373,39 @@ def delete_files(repo_type: str, repo_id: str, names: Iterable[str]) -> dict[str
     freed = 0
     deleted: list[str] = []
     missing: list[str] = []
+    failed: list[str] = []
     for name, target in targets:
         if not target.is_file():
             # Someone else got there first, or the interface is showing a
             # listing that has since moved on.
             missing.append(name)
             continue
-        size = target.stat().st_size
-        target.unlink()
+        try:
+            size = target.stat().st_size
+            target.unlink()
+        except OSError:
+            # A file we may not touch — an ACL, a read-only mount. The ones
+            # already unlinked stay gone, so the run has to carry on and narrow
+            # the selection anyway: stopping here would leave the marker naming
+            # files that no longer exist, and the next update would fetch them.
+            failed.append(name)
+            continue
         deleted.append(name)
         freed += size + _drop_bookkeeping(path, target.relative_to(path).as_posix())
         _prune_empty_dirs(target.parent, path)
 
     invalidate(path)
     remaining = sorted(p.relative_to(path).as_posix() for p in _iter_content_files(path))
+    warnings: list[str] = []
+    if failed:
+        warnings.append(
+            f"{len(failed)} file(s) could not be removed — check the permissions on the folder."
+        )
+
     result: dict[str, Any] = {
         "deleted": deleted,
         "missing": missing,
+        "failed": failed,
         "freed": freed,
         "remaining": len(remaining),
         "removed_repo": False,
@@ -391,14 +418,26 @@ def delete_files(repo_type: str, repo_id: str, names: Iterable[str]) -> dict[str
         # emptying it out asked for.
         result["freed"] += delete_repo(repo_type, repo_id)["freed"]
         result["removed_repo"] = True
+        result["warning"] = " ".join(warnings)
         return result
 
     try:
-        _narrow_marker(path, remaining)
+        if not _narrow_marker(path, remaining):
+            # No record to narrow, so the promise the interface makes for this
+            # button does not hold here. Say it rather than let an update
+            # quietly restore what was just deleted.
+            warnings.append(
+                "This copy has no download record, so an update fetches the whole repo again "
+                "— including what you just deleted."
+            )
     except OSError as exc:
         # The files are gone either way; say so rather than failing the call,
         # but do not let the stale selection pass unmentioned.
-        result["warning"] = f"Deleted, but the download record could not be updated ({exc}). An update may fetch them again."
+        warnings.append(
+            f"Deleted, but the download record could not be updated ({exc}). An update may fetch them again."
+        )
+
+    result["warning"] = " ".join(warnings)
     return result
 
 

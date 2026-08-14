@@ -287,7 +287,10 @@ class TestFileDeletion:
             "/api/library/files/delete", json={"repo_id": "org/name", "files": [" "]}
         ).status_code == 400
 
-    @pytest.mark.parametrize("name", ["../../etc/passwd", "/etc/passwd", ".cache/x", config.MARKER_NAME])
+    @pytest.mark.parametrize(
+        "name",
+        ["../../etc/passwd", "/etc/passwd", ".cache/x", config.MARKER_NAME, ".", "./", ".TROVE.json"],
+    )
     def test_traversal_is_a_400(self, client, repo_factory, name):
         repo_factory("org/name", files={"a.bin": 10})
         assert client.post(
