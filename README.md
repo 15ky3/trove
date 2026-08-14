@@ -75,8 +75,9 @@ public or private, with the same live progress.
 <tr><td>
 
 **Keep the shelf tidy**
-Sizes, file counts, revisions and commit hashes per repo. Inspect the files,
-delete what you no longer need.
+Sizes, file counts, revisions and commit hashes per repo. Walk a repo folder by
+folder, tick the files you no longer need and drop them — and an update stops
+fetching exactly those.
 
 </td><td>
 
@@ -326,6 +327,27 @@ single entry, because half of a split quant is worth nothing.
 The selection is stored alongside the download, so **Refresh from Hub** on a
 partial copy fetches the same files again instead of suddenly pulling the whole
 repo. Partial copies are marked as such in the library.
+
+### Editing a repo you already have
+
+The file list in the detail panel is a browser: folders are shown as folders and
+open on click, a breadcrumb leads back out, and a filter searches the whole repo
+at once. Tick anything — a single file or a whole folder — and **Delete n files**
+removes it.
+
+Deleting is more than an `rm`. Along with the file goes the record
+`huggingface_hub` keeps for it, and the selection stored with the copy is
+narrowed to what is left. That is what makes the next update do the right thing:
+it fetches the remaining files only and never restores what you removed. Delete
+everything and the repo leaves the library instead of staying behind as an empty
+shell that an update would refill.
+
+The names come from the browser, so they are treated as hostile: a `..`, an
+absolute path, a symlink pointing out of the repo or an attempt at the
+bookkeeping folder is refused before anything is touched — and one bad name in a
+batch means nothing at all is deleted. A repo that is currently being
+transferred cannot be edited; the running download would just fetch the files
+again.
 
 ### A Hub quirk worth knowing
 
