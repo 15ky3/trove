@@ -12,8 +12,9 @@ of our own, bound to localhost, counting the bytes it relays.
 One proxy serves every worker, and it lives in the API process rather than in
 each of them. A ceiling that each transfer applies for itself is not a ceiling:
 two parallel downloads would take twice the configured rate. Shared, the number
-in Settings is the number on the line, and changing it retunes the transfers
-that are already running.
+in Settings is the number on the line, and changing it retunes every transfer
+that was started while a limit was on — a worker that started without one was
+never given the address and stays outside.
 
 Only CONNECT is served. Every Hub endpoint is https and a CONNECT tunnel is
 relayed byte for byte — no TLS is terminated, no certificate has to exist, and
@@ -157,9 +158,9 @@ async def _reply(writer: asyncio.StreamWriter, status: int, reason: str) -> None
 class ThrottledProxy:
     """A CONNECT proxy on localhost that caps what it relays downstream.
 
-    Upstream (what we send to the Hub) runs unthrottled: this exists to stop a
-    download from eating the line, and an upload is paced by the same setting
-    only if someone asks for it.
+    Only the downstream direction pays. What we send to the Hub goes through
+    untouched, so an upload running while a limit is set is tunnelled but not
+    slowed — which is what the setting promises.
     """
 
     def __init__(
