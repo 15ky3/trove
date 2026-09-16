@@ -114,9 +114,12 @@ class TestSettings:
     def test_the_speed_limit_is_off_by_default(self):
         assert config.DEFAULT_SETTINGS["max_download_mbit"] == 0.0
 
-    def test_a_speed_limit_that_is_not_a_number_is_ignored(self):
+    @pytest.mark.parametrize("given", ["quick", float("nan"), float("inf"), float("-inf")])
+    def test_a_speed_limit_that_is_not_a_number_is_ignored(self, given):
+        # NaN used to survive the clamp as the maximum: min(10_000, nan) is
+        # 10_000, so a broken value bought a 10 Gbit/s ceiling.
         config.settings.update({"max_download_mbit": 12})
-        config.settings.update({"max_download_mbit": "quick"})
+        config.settings.update({"max_download_mbit": given})
         assert config.settings.get("max_download_mbit") == 12.0
 
     def test_non_numeric_is_ignored(self):

@@ -141,6 +141,19 @@ class TestSettingsEndpoint:
         assert client.put("/api/settings", json={"max_download_mbit": 30}).json()["max_download_mbit"] == 30.0
         assert client.get("/api/settings").json()["max_download_mbit"] == 30.0
 
+    def test_a_speed_limit_of_nan_is_refused(self, client):
+        # Pydantic lets NaN through to the validator, where it used to clamp to
+        # the maximum instead of being dropped.
+        client.put("/api/settings", json={"max_download_mbit": 20})
+        # A JSON encoder refuses to write NaN, so it arrives as a raw body —
+        # which json.loads on the server side happily accepts.
+        body = client.put(
+            "/api/settings",
+            content='{"max_download_mbit": NaN}',
+            headers={"content-type": "application/json"},
+        ).json()
+        assert body["max_download_mbit"] == 20.0
+
     def test_a_negative_speed_limit_means_off(self, client):
         assert client.put("/api/settings", json={"max_download_mbit": -1}).json()["max_download_mbit"] == 0.0
 

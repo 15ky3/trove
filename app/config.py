@@ -8,6 +8,7 @@ defaults: whatever is set in the web interface wins.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -116,6 +117,12 @@ class Settings:
                 try:
                     value = float(value)
                 except (TypeError, ValueError):
+                    continue
+                # json.loads accepts a bare NaN, and clamping one yields the
+                # maximum rather than nothing: min(10_000, nan) keeps 10_000
+                # because the comparison is false. Refuse it like any other
+                # value that is not a number.
+                if not math.isfinite(value):
                     continue
                 # A negative ceiling would mean "stop entirely"; it means "off".
                 value = max(0.0, min(MAX_DOWNLOAD_MBIT, round(value, 1)))
