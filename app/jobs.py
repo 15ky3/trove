@@ -381,8 +381,7 @@ class JobManager:
         # at the moment the worker starts. Nothing is removed when no limit is
         # set: a proxy the operator configured for the container stays the
         # worker's proxy.
-        env.update(throttle.shared.env())
-        return env
+        return throttle.shared.apply_to_env(env)
 
     async def _run(self, job: Job) -> None:
         proc: asyncio.subprocess.Process | None = None

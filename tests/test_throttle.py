@@ -494,18 +494,18 @@ def stop_shared():
 class TestSharedLimit:
     def test_off_by_default(self):
         assert throttle.shared.apply(0) == ""
-        assert throttle.shared.env() == {}
+        assert throttle.shared.apply_to_env({}) == {}
         assert throttle.shared.mbit == 0.0
 
     @pytest.mark.parametrize("value", [0, 0.0, None, "", "fast", [], -5])
     def test_nothing_or_nonsense_means_no_limit(self, value):
         assert throttle.shared.apply(value) == ""
-        assert throttle.shared.env() == {}
+        assert throttle.shared.apply_to_env({}) == {}
 
     def test_a_limit_starts_a_proxy_and_names_every_variable(self):
         url = throttle.shared.apply(8)
         assert url.startswith("http://127.0.0.1:")
-        assert throttle.shared.env() == {var: url for var in throttle.PROXY_VARS}
+        assert throttle.shared.apply_to_env({}) == {var: url for var in throttle.PROXY_VARS}
         assert throttle.shared.mbit == 8
 
     def test_mbit_is_a_million_bits(self):
@@ -528,7 +528,7 @@ class TestSharedLimit:
     def test_setting_it_to_zero_sends_new_workers_out_directly(self):
         throttle.shared.apply(10)
         assert throttle.shared.apply(0) == ""
-        assert throttle.shared.env() == {}
+        assert throttle.shared.apply_to_env({}) == {}
         assert throttle.shared.mbit == 0.0
 
     def test_setting_it_to_zero_leaves_running_transfers_alone(self, upstream):
@@ -615,8 +615,27 @@ class TestSharedLimit:
 
         # No limit is better than no download.
         assert throttle.shared.apply(10, lines.append) == ""
-        assert throttle.shared.env() == {}
+        assert throttle.shared.apply_to_env({}) == {}
         assert "address already in use" in lines[0]
+
+    def test_a_plain_http_endpoint_is_not_sent_through_the_tunnel(self):
+        # This proxy speaks CONNECT only. An absolute-form GET — what a client
+        # sends for an http:// endpoint — would come back 405 and break every
+        # download, so those spellings are deliberately not set.
+        throttle.shared.apply(10)
+        env = throttle.shared.apply_to_env({})
+        assert "HTTP_PROXY" not in env and "http_proxy" not in env
+        assert "ALL_PROXY" not in env and "all_proxy" not in env
+
+    @pytest.mark.parametrize("var", ["NO_PROXY", "no_proxy"])
+    def test_an_exclusion_list_is_cleared_while_a_limit_is_on(self, var):
+        throttle.shared.apply(10)
+        env = throttle.shared.apply_to_env({var: "huggingface.co"})
+        assert var not in env
+
+    @pytest.mark.parametrize("var", ["NO_PROXY", "no_proxy"])
+    def test_an_exclusion_list_survives_when_nothing_is_limited(self, var):
+        assert throttle.shared.apply_to_env({var: "huggingface.co"})[var] == "huggingface.co"
 
     def test_it_works_without_a_log(self):
         assert throttle.shared.apply(1)
@@ -625,4 +644,4 @@ class TestSharedLimit:
         throttle.shared.apply(10)
         throttle.shared.stop()
         throttle.shared.stop()
-        assert throttle.shared.env() == {}
+        assert throttle.shared.apply_to_env({}) == {}

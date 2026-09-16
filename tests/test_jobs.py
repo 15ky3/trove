@@ -460,6 +460,16 @@ class TestWorkerEnvironment:
         throttle.shared.stop()
         assert not any(var in manager._build_env() for var in throttle.PROXY_VARS)
 
+    def test_an_exclusion_list_cannot_walk_past_the_speed_limit(self, monkeypatch):
+        # NO_PROXY=huggingface.co would send the worker straight out while the
+        # interface still showed a ceiling.
+        monkeypatch.setenv("NO_PROXY", "huggingface.co")
+        throttle.shared.apply(20)
+        try:
+            assert "NO_PROXY" not in manager._build_env()
+        finally:
+            throttle.shared.stop()
+
     def test_a_proxy_the_operator_set_survives(self, monkeypatch):
         # Someone running Trove behind a company proxy keeps it; the speed
         # limit is the only reason we ever touch these variables.

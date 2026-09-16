@@ -57,16 +57,19 @@ HEADER_LIMIT = 32 * 1024
 #: How long to wait for the proxy thread to report a bound port.
 START_TIMEOUT = 10.0
 
-#: Every spelling a client might read. httpx and reqwest both look at the
-#: uppercase and the lowercase form.
-PROXY_VARS = (
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-)
+#: What a worker is told to use. Only the https spellings: this proxy speaks
+#: CONNECT and nothing else, and a plain-http endpoint — a self-hosted mirror
+#: is allowed to be one — would be sent here as an absolute-form GET and
+#: refused. Such a mirror now goes out directly, unthrottled but working.
+#: Measured: the Xet client routes through HTTPS_PROXY alone, ALL_PROXY is not
+#: needed. Both cases are covered because httpx and reqwest disagree on which
+#: spelling they read.
+PROXY_VARS = ("HTTPS_PROXY", "https_proxy")
+
+#: Cleared while a limit is on. An operator who excluded the Hub from their
+#: company proxy would otherwise send the worker straight past the limiter,
+#: with the interface still showing a ceiling that does nothing.
+NO_PROXY_VARS = ("NO_PROXY", "no_proxy")
 
 
 class TokenBucket:
@@ -444,13 +447,20 @@ class SharedLimit:
             self._limited = True
             return url
 
-    def env(self) -> dict[str, str]:
-        """Proxy variables for a worker, empty when nothing is limited.
+    def apply_to_env(self, env: dict[str, str]) -> dict[str, str]:
+        """Point a worker's environment at the limiter, if there is one.
 
-        Every spelling is set: httpx and the Xet client do not agree on case.
+        Without a limit the environment is left exactly as it is, so a proxy
+        the operator configured for the container stays the worker's proxy.
         """
         url = self.url
-        return {var: url for var in PROXY_VARS} if url else {}
+        if not url:
+            return env
+        for var in PROXY_VARS:
+            env[var] = url
+        for var in NO_PROXY_VARS:
+            env.pop(var, None)
+        return env
 
     def stop(self) -> None:
         with self._lock:
