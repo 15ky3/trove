@@ -47,8 +47,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Drop finished jobs from the queue list automatically.
     "auto_clear_done": False,
     # Download speed ceiling in Mbit/s, 0 for none. Enforced by a local proxy
-    # in the worker (see app/throttle.py), because the kernel this ships to
-    # cannot shape a container's incoming traffic.
+    # the app runs and every worker shares (see app/throttle.py), because the
+    # kernel this ships to cannot shape a container's incoming traffic.
     "max_download_mbit": 0.0,
 }
 

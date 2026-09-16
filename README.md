@@ -298,16 +298,24 @@ downloads in flight. On a NAS, lowering either is the fix.
 ### Capping the download speed
 
 **Speed limit** in Settings takes a ceiling in Mbit/s; `0` means none. It is one
-budget for everything together, not per transfer, it takes effect the moment you
-save it — downloads already running included — and it covers downloads only,
+budget for everything together, not per transfer, and it covers downloads only,
 never uploads.
 
+When it reaches a transfer that is already running depends on how that transfer
+started. A download that began while a limit was set follows every later change,
+including clearing it — the ceiling is read for each chunk. A download that began
+with no limit at all was never sent through the limiter and cannot be caught
+afterwards, so switching the limit on applies from the next transfer.
+
 Behind it is a small CONNECT proxy on localhost, started by the app and pointed
-at through the usual proxy variables when a worker starts. Both the Python HTTP
-path and the Xet client read those, so both go through it, and because CONNECT
-is a plain tunnel nothing is decrypted on the way: no certificate, no
-interception, no change to what arrives on disk. A proxy you configured for the
-container yourself stays untouched as long as no limit is set.
+at through `HTTPS_PROXY` when a worker starts. Both the Python HTTP path and the
+Xet client read that, so both go through it, and because CONNECT is a plain
+tunnel nothing is decrypted on the way: no certificate, no interception, no
+change to what arrives on disk. A proxy you configured for the container
+yourself stays untouched while no limit is set, and is used as the way out when
+one is — nothing is dialled directly behind your network's back. An endpoint on
+plain `http://` is the one thing that does not go through the limiter; it is
+sent out directly rather than being broken by a proxy that only speaks CONNECT.
 
 What is capped is the line, not the disk: Xet transfers compressed and skips
 chunks it can reconstruct from what you already have, so a repo can land faster

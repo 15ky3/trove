@@ -225,7 +225,7 @@
           <label for="set-limit">Speed limit</label>
           <div class="form-control">
             <input class="field field-num mono" id="set-limit" type="number" min="0" max="10000" step="1">
-            <p class="hint">Download ceiling in Mbit/s, 0 for no limit. One budget for all transfers together, and it takes effect immediately — running downloads included. Uploads are never throttled.</p>
+            <p class="hint">Download ceiling in Mbit/s, 0 for no limit — one budget for all transfers together. Changing or clearing it reaches downloads that started while a limit was set; switching it on from 0 applies to the next transfer. Uploads are never throttled.</p>
           </div>
         </div>
         <div class="form-row">
