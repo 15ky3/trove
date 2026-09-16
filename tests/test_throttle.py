@@ -6,6 +6,7 @@ that the proxy tunnels to, which is all a CONNECT proxy ever sees anyway.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import socket
@@ -94,26 +95,6 @@ class TestTokenBucket:
         with pytest.raises(ValueError):
             bucket.set_rate(rate)
 
-    def test_refund_returns_unused_tokens(self):
-        clock = FakeClock()
-        bucket = throttle.TokenBucket(1000, burst=500, clock=clock)
-        bucket.grant(500)
-        bucket.refund(300)
-        assert bucket.grant(500)[0] == 300
-
-    def test_refund_respects_the_burst_size(self):
-        bucket = throttle.TokenBucket(1000, burst=500, clock=FakeClock())
-        bucket.refund(10_000)
-        assert bucket.grant(10_000)[0] == 500
-
-    @pytest.mark.parametrize("amount", [0, -5])
-    def test_refund_ignores_nothing_and_nonsense(self, amount):
-        clock = FakeClock()
-        bucket = throttle.TokenBucket(1000, burst=500, clock=clock)
-        bucket.grant(500)
-        bucket.refund(amount)
-        assert bucket.grant(500)[0] == 0
-
     @pytest.mark.parametrize("want", [0, -1])
     def test_asking_for_nothing_grants_nothing(self, want):
         bucket = throttle.TokenBucket(1000, clock=FakeClock())
@@ -127,6 +108,19 @@ class TestTokenBucket:
     def test_default_burst_is_never_smaller_than_a_chunk(self):
         # A slow line must still be able to move one read at a time.
         assert throttle.TokenBucket(10).capacity == throttle.MIN_BURST
+
+
+class TestPaying:
+    def test_pays_the_whole_amount_in_whatever_pieces_it_gets(self):
+        bucket = throttle.TokenBucket(100_000, burst=100)
+        asyncio.run(throttle._pay(bucket, 300))
+        # Everything was paid for: nothing is left to hand out right away.
+        assert bucket.grant(300)[0] < 300
+
+    def test_paying_for_nothing_returns_at_once(self):
+        bucket = throttle.TokenBucket(1000, burst=500, clock=FakeClock())
+        asyncio.run(throttle._pay(bucket, 0))
+        assert bucket.grant(500)[0] == 500
 
 
 # ------------------------------------------------------------ Upstream stand-in
@@ -310,6 +304,51 @@ class TestTunnel:
         assert results == [len(payload)] * 3
         # 3 × 165_536 bytes minus one shared burst, at 200_000 B/s.
         assert elapsed >= 1.0, f"three tunnels finished in {elapsed:.2f}s — budget not shared"
+
+
+class TestBudgetAccounting:
+    """What the ceiling is worth over a long transfer, not just a short one."""
+
+    def test_connections_that_end_do_not_burn_the_budget(self, proxy, upstream):
+        # Charging before the read meant every tunnel kept what it had taken
+        # for the read that returned nothing — up to 64 KiB per connection,
+        # gone for good. Xet churns connections, so the rate drifted below the
+        # ceiling the longer a transfer ran.
+        rate = 50_000
+        server = upstream(blast(b"ab"))
+        instance = proxy(rate)
+
+        for _ in range(6):
+            sock, _ = tunnel(instance.url, server.host, server.port)
+            assert read_all(sock) == b"ab"
+            sock.close()
+
+        left, _ = instance.bucket.grant(10**9)
+        assert left >= instance.bucket.capacity * 0.8, (
+            f"only {left} of {instance.bucket.capacity:.0f} tokens left after 12 bytes"
+        )
+
+    def test_an_idle_tunnel_does_not_hold_the_budget(self, proxy, upstream):
+        # A connection between range requests used to park a reservation the
+        # connections with data to move were waiting for.
+        rate = 100_000
+        idle_server = upstream(lambda conn: time.sleep(5))
+        busy_server = upstream(blast(b"z" * throttle.MIN_BURST))
+        instance = proxy(rate)
+
+        idle, _ = tunnel(instance.url, idle_server.host, idle_server.port)
+        try:
+            started = time.monotonic()
+            sock, _ = tunnel(instance.url, busy_server.host, busy_server.port)
+            received = read_all(sock)
+            elapsed = time.monotonic() - started
+            sock.close()
+        finally:
+            idle.close()
+
+        assert len(received) == throttle.MIN_BURST
+        # The burst covers it; nothing should have been waiting on the idle one.
+        assert elapsed < 0.4, f"a burst-sized transfer waited {elapsed:.2f}s"
 
 
 class TestRefusals:

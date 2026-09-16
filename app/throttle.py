@@ -122,13 +122,6 @@ class TokenBucket:
             self.capacity = max(self.rate * BURST_SECONDS, MIN_BURST)
             self._tokens = min(self._tokens, self.capacity)
 
-    def refund(self, amount: int) -> None:
-        """Give back tokens taken for bytes that never arrived."""
-        if amount <= 0:
-            return
-        with self._lock:
-            self._tokens = min(self.capacity, self._tokens + amount)
-
 
 def _close(writer: asyncio.StreamWriter) -> None:
     try:
@@ -262,15 +255,24 @@ class ThrottledProxy:
         writer: asyncio.StreamWriter,
         bucket: TokenBucket | None,
     ) -> None:
+        """Move bytes one way, paying for them before they are handed on.
+
+        Read first, pay second. Reserving before the read looked tidier and was
+        wrong twice over: a connection that ended on the read kept whatever it
+        had taken, so every closed tunnel quietly removed up to a chunk from the
+        shared budget for good, and a connection sitting idle between range
+        requests parked a reservation that the ones with data to move were
+        waiting for. Paying for bytes that exist costs nothing that is not
+        already in hand: the data waits in memory instead of on the socket, and
+        the sender is held back by its own window.
+        """
         try:
             while True:
-                size = CHUNK if bucket is None else await self._take(bucket, CHUNK)
-                data = await reader.read(size)
+                data = await reader.read(CHUNK)
                 if not data:
                     break
-                if bucket is not None and len(data) < size:
-                    # Paid for more than the socket had; the rest stays ours.
-                    bucket.refund(size - len(data))
+                if bucket is not None:
+                    await _pay(bucket, len(data))
                 writer.write(data)
                 await writer.drain()
         except (OSError, ConnectionError, asyncio.IncompleteReadError):
@@ -280,12 +282,16 @@ class ThrottledProxy:
             # this side is done, so close it rather than leave it hanging.
             _close(writer)
 
-    @staticmethod
-    async def _take(bucket: TokenBucket, want: int) -> int:
-        while True:
-            granted, wait = bucket.grant(want)
-            if granted:
-                return granted
+
+async def _pay(bucket: TokenBucket, amount: int) -> None:
+    """Block until `amount` bytes have been paid for, in whatever pieces the
+    bucket hands out."""
+    outstanding = amount
+    while outstanding > 0:
+        granted, wait = bucket.grant(outstanding)
+        if granted:
+            outstanding -= granted
+        else:
             await asyncio.sleep(wait)
 
 
