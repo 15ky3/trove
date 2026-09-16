@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import storage, throttle
+from . import storage
 from .config import LEGACY_MARKER_NAMES, MARKER_NAME
 
 # Progress comes out of huggingface_hub's own tqdm objects; we do not want
@@ -582,11 +582,6 @@ def main(argv: list[str]) -> int:
         emit("error", msg=f"Invalid payload: {exc}")
         return 2
 
-    # Before anything talks to the Hub: the limiter works by pointing the proxy
-    # variables at a local port, and both httpx and the Xet client read those
-    # when they build their first connection.
-    limiter = throttle.start_limit(payload.get("limit_mbit"), log)
-
     try:
         if payload.get("kind") == "upload":
             run_upload(payload)
@@ -603,9 +598,6 @@ def main(argv: list[str]) -> int:
         progress.stop()
         emit("error", msg=_describe(exc))
         return 1
-    finally:
-        if limiter is not None:
-            limiter.stop()
     return 0
 
 

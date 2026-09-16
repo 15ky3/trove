@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from starlette.testclient import TestClient
 
-from app import __version__, config, hub, storage
+from app import __version__, config, hub, storage, throttle
 from app.jobs import RUNNING, manager
 from conftest import PASSWORD, use_stub_worker
 
@@ -143,6 +143,30 @@ class TestSettingsEndpoint:
 
     def test_a_negative_speed_limit_means_off(self, client):
         assert client.put("/api/settings", json={"max_download_mbit": -1}).json()["max_download_mbit"] == 0.0
+
+    def test_saving_a_speed_limit_arms_the_limiter(self, client):
+        try:
+            client.put("/api/settings", json={"max_download_mbit": 16})
+            assert throttle.shared.mbit == 16
+            assert throttle.shared.url
+        finally:
+            throttle.shared.stop()
+
+    def test_raising_the_limit_retunes_without_a_restart(self, client):
+        # Transfers already running point at this port.
+        try:
+            client.put("/api/settings", json={"max_download_mbit": 16})
+            url = throttle.shared.url
+            client.put("/api/settings", json={"max_download_mbit": 64})
+            assert throttle.shared.url == url
+            assert throttle.shared.mbit == 64
+        finally:
+            throttle.shared.stop()
+
+    def test_clearing_the_limit_takes_the_limiter_down(self, client):
+        client.put("/api/settings", json={"max_download_mbit": 16})
+        client.put("/api/settings", json={"max_download_mbit": 0})
+        assert throttle.shared.url == ""
 
     def test_omitted_fields_are_left_alone(self, client):
         client.put("/api/settings", json={"endpoint": "https://mirror"})

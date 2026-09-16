@@ -9,6 +9,12 @@ The one chokepoint both the Rust client and the Python HTTP path share is the
 proxy they read from the environment, so that is where the limit goes: a proxy
 of our own, bound to localhost, counting the bytes it relays.
 
+One proxy serves every worker, and it lives in the API process rather than in
+each of them. A ceiling that each transfer applies for itself is not a ceiling:
+two parallel downloads would take twice the configured rate. Shared, the number
+in Settings is the number on the line, and changing it retunes the transfers
+that are already running.
+
 Only CONNECT is served. Every Hub endpoint is https and a CONNECT tunnel is
 relayed byte for byte — no TLS is terminated, no certificate has to exist, and
 a repo that is not Xet-backed travels through the same tunnel.
@@ -104,6 +110,17 @@ class TokenBucket:
             # caller wakes up thousands of times a second to move nothing.
             deficit = min(want, self.capacity) - self._tokens
             return 0, max(deficit / self.rate, MIN_SLEEP)
+
+    def set_rate(self, rate: float) -> None:
+        """Retune while running. Tokens already earned survive, up to the new
+        burst size — a ceiling lowered mid-transfer must not stay generous."""
+        if rate <= 0:
+            raise ValueError("rate must be positive")
+        with self._lock:
+            self._refill()
+            self.rate = float(rate)
+            self.capacity = max(self.rate * BURST_SECONDS, MIN_BURST)
+            self._tokens = min(self._tokens, self.capacity)
 
     def refund(self, amount: int) -> None:
         """Give back tokens taken for bytes that never arrived."""
@@ -293,31 +310,77 @@ def _connect_target(head: bytes) -> tuple[str, int] | None:
     return host.strip("[]"), number
 
 
-def start_limit(mbit: Any, log: Callable[..., None] | None = None) -> ThrottledProxy | None:
-    """Start a limiter for this process and point the proxy variables at it.
+class SharedLimit:
+    """The one limiter every transfer of this instance goes through.
 
-    Zero, nothing, or a value that is not a number means no limit and no proxy —
-    the transfer then runs exactly as it did before this module existed. A
-    limiter that cannot bind is reported and skipped: a speed setting is not
-    worth failing a download over.
+    Held by the API process: it outlives single jobs, so a changed ceiling
+    reaches a download that is already running, and two transfers share one
+    budget instead of getting one each.
     """
-    try:
-        rate = float(mbit or 0)
-    except (TypeError, ValueError):
-        rate = 0.0
-    if rate <= 0:
-        return None
 
-    proxy = ThrottledProxy(rate * BYTES_PER_MBIT)
-    try:
-        url = proxy.start()
-    except Exception as exc:  # noqa: BLE001 - never fatal
-        if log is not None:
-            log(f"Speed limit of {rate:g} Mbit/s not applied: {exc}", "warn")
-        return None
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proxy: ThrottledProxy | None = None
+        self.mbit = 0.0
 
-    for var in PROXY_VARS:
-        os.environ[var] = url
-    if log is not None:
-        log(f"Speed limit: {rate:g} Mbit/s.")
-    return proxy
+    @property
+    def url(self) -> str:
+        proxy = self._proxy
+        return proxy.url if proxy is not None else ""
+
+    def apply(self, mbit: Any, log: Callable[..., None] | None = None) -> str:
+        """Set the ceiling in Mbit/s. Zero — or nonsense — turns it off.
+
+        Returns the proxy URL, or an empty string when nothing is limited. A
+        limiter that cannot bind is reported and skipped: a speed setting is not
+        worth failing every download over.
+        """
+        try:
+            rate = float(mbit or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        rate = max(0.0, rate)
+
+        with self._lock:
+            if rate <= 0:
+                self._shutdown()
+                return ""
+
+            if self._proxy is not None:
+                self._proxy.bucket.set_rate(rate * BYTES_PER_MBIT)
+                self.mbit = rate
+                return self._proxy.url
+
+            proxy = ThrottledProxy(rate * BYTES_PER_MBIT)
+            try:
+                url = proxy.start()
+            except Exception as exc:  # noqa: BLE001 - never fatal
+                if log is not None:
+                    log(f"Speed limit of {rate:g} Mbit/s not applied: {exc}")
+                return ""
+            self._proxy = proxy
+            self.mbit = rate
+            return url
+
+    def env(self) -> dict[str, str]:
+        """Proxy variables for a worker, empty when nothing is limited.
+
+        Every spelling is set: httpx and the Xet client do not agree on case.
+        """
+        url = self.url
+        return {var: url for var in PROXY_VARS} if url else {}
+
+    def stop(self) -> None:
+        with self._lock:
+            self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Caller holds the lock."""
+        if self._proxy is not None:
+            self._proxy.stop()
+            self._proxy = None
+        self.mbit = 0.0
+
+
+#: The instance everything else talks to.
+shared = SharedLimit()

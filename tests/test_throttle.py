@@ -72,6 +72,28 @@ class TestTokenBucket:
         bucket.grant(64)
         assert bucket.grant(64)[1] >= throttle.MIN_SLEEP
 
+    def test_set_rate_retunes_a_running_bucket(self):
+        clock = FakeClock()
+        bucket = throttle.TokenBucket(1000, burst=500, clock=clock)
+        bucket.grant(500)
+        bucket.set_rate(2000)
+        clock.advance(0.25)
+        assert bucket.grant(10_000)[0] == 500
+
+    def test_set_rate_takes_away_a_burst_that_is_now_too_large(self):
+        clock = FakeClock()
+        bucket = throttle.TokenBucket(1_000_000, clock=clock)
+        # A ceiling lowered mid-transfer must not leave a fat bucket behind.
+        bucket.set_rate(1000)
+        assert bucket.capacity == throttle.MIN_BURST
+        assert bucket.grant(10_000_000)[0] <= throttle.MIN_BURST
+
+    @pytest.mark.parametrize("rate", [0, -1])
+    def test_set_rate_refuses_a_rate_that_means_nothing(self, rate):
+        bucket = throttle.TokenBucket(1000, clock=FakeClock())
+        with pytest.raises(ValueError):
+            bucket.set_rate(rate)
+
     def test_refund_returns_unused_tokens(self):
         clock = FakeClock()
         bucket = throttle.TokenBucket(1000, burst=500, clock=clock)
@@ -361,72 +383,104 @@ class TestLifecycle:
         throttle.ThrottledProxy(1_000_000).stop()
 
 
-# ------------------------------------------------------------- Env plumbing
+# -------------------------------------------------------- The shared limiter
 
 
 @pytest.fixture(autouse=True)
-def clean_proxy_env():
-    saved = {var: os.environ.get(var) for var in throttle.PROXY_VARS}
-    for var in throttle.PROXY_VARS:
-        os.environ.pop(var, None)
+def stop_shared():
     yield
-    for var, value in saved.items():
-        if value is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = value
+    throttle.shared.stop()
 
 
-class TestStartLimit:
+class TestSharedLimit:
+    def test_off_by_default(self):
+        assert throttle.shared.apply(0) == ""
+        assert throttle.shared.env() == {}
+        assert throttle.shared.mbit == 0.0
+
     @pytest.mark.parametrize("value", [0, 0.0, None, "", "fast", [], -5])
-    def test_no_limit_means_no_proxy(self, value):
-        lines: list[str] = []
-        assert throttle.start_limit(value, lambda msg, level="info": lines.append(msg)) is None
-        assert not any(os.environ.get(var) for var in throttle.PROXY_VARS)
-        assert lines == []
+    def test_nothing_or_nonsense_means_no_limit(self, value):
+        assert throttle.shared.apply(value) == ""
+        assert throttle.shared.env() == {}
 
-    def test_a_limit_points_every_proxy_variable_at_us(self):
-        lines: list[str] = []
-        limiter = throttle.start_limit(8, lambda msg, level="info": lines.append(msg))
-        assert limiter is not None
-        try:
-            assert all(os.environ[var] == limiter.url for var in throttle.PROXY_VARS)
-            assert "8 Mbit/s" in lines[0]
-        finally:
-            limiter.stop()
+    def test_a_limit_starts_a_proxy_and_names_every_variable(self):
+        url = throttle.shared.apply(8)
+        assert url.startswith("http://127.0.0.1:")
+        assert throttle.shared.env() == {var: url for var in throttle.PROXY_VARS}
+        assert throttle.shared.mbit == 8
 
     def test_mbit_is_a_million_bits(self):
-        limiter = throttle.start_limit(8)
-        assert limiter is not None
-        try:
-            # 8 Mbit/s is a megabyte a second.
-            assert limiter.bucket.rate == pytest.approx(1_000_000)
-        finally:
-            limiter.stop()
+        throttle.shared.apply(8)
+        # 8 Mbit/s is a megabyte a second.
+        assert throttle.shared._proxy.bucket.rate == pytest.approx(1_000_000)
 
     def test_a_string_that_is_a_number_still_works(self):
-        limiter = throttle.start_limit("2.5")
-        assert limiter is not None
-        try:
-            assert limiter.bucket.rate == pytest.approx(2.5 * throttle.BYTES_PER_MBIT)
-        finally:
-            limiter.stop()
+        throttle.shared.apply("2.5")
+        assert throttle.shared._proxy.bucket.rate == pytest.approx(2.5 * throttle.BYTES_PER_MBIT)
+
+    def test_changing_the_limit_keeps_the_same_proxy(self):
+        # Running transfers point at this port; restarting it would break them.
+        first = throttle.shared.apply(10)
+        second = throttle.shared.apply(50)
+        assert first == second
+        assert throttle.shared._proxy.bucket.rate == pytest.approx(50 * throttle.BYTES_PER_MBIT)
+        assert throttle.shared.mbit == 50
+
+    def test_setting_it_to_zero_takes_the_proxy_down(self):
+        url = throttle.shared.apply(10)
+        assert throttle.shared.apply(0) == ""
+        assert throttle.shared.env() == {}
+        with pytest.raises(OSError):
+            talk(url).close()
+
+    def test_switching_it_back_on_binds_again(self):
+        throttle.shared.apply(10)
+        throttle.shared.apply(0)
+        assert throttle.shared.apply(10).startswith("http://127.0.0.1:")
+
+    def test_the_budget_is_shared_by_everything_going_through_it(self, upstream):
+        # The point of one limiter for the whole app: two transfers together
+        # get the configured rate, not one each.
+        throttle.shared.apply(1.6)  # 200_000 B/s
+        payload = b"q" * (throttle.MIN_BURST + 100_000)
+        server = upstream(blast(payload))
+        url = throttle.shared.url
+
+        sizes: list[int] = []
+
+        def pull() -> None:
+            sock, _ = tunnel(url, server.host, server.port)
+            sizes.append(len(read_all(sock)))
+            sock.close()
+
+        started = time.monotonic()
+        threads = [threading.Thread(target=pull) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        elapsed = time.monotonic() - started
+
+        assert sizes == [len(payload)] * 2
+        assert elapsed >= 0.8, f"two transfers finished in {elapsed:.2f}s — budget not shared"
 
     def test_a_limiter_that_cannot_bind_is_skipped(self, monkeypatch):
         def refuse(self):
             raise OSError("address already in use")
 
         monkeypatch.setattr(throttle.ThrottledProxy, "start", refuse)
-        lines: list[tuple[str, str]] = []
-        result = throttle.start_limit(10, lambda msg, level="info": lines.append((msg, level)))
+        lines: list[str] = []
 
         # No limit is better than no download.
-        assert result is None
-        assert not any(os.environ.get(var) for var in throttle.PROXY_VARS)
-        assert lines[0][1] == "warn"
-        assert "address already in use" in lines[0][0]
+        assert throttle.shared.apply(10, lines.append) == ""
+        assert throttle.shared.env() == {}
+        assert "address already in use" in lines[0]
 
     def test_it_works_without_a_log(self):
-        limiter = throttle.start_limit(1)
-        assert limiter is not None
-        limiter.stop()
+        assert throttle.shared.apply(1)
+
+    def test_stop_is_idempotent(self):
+        throttle.shared.apply(10)
+        throttle.shared.stop()
+        throttle.shared.stop()
+        assert throttle.shared.env() == {}

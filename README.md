@@ -297,15 +297,21 @@ downloads in flight. On a NAS, lowering either is the fix.
 
 ### Capping the download speed
 
-**Speed limit** in Settings takes a ceiling in Mbit/s; `0` means none. It applies
-to transfers started after you save it — a transfer already running keeps the
-speed it began with — and it covers downloads only, never uploads.
+**Speed limit** in Settings takes a ceiling in Mbit/s; `0` means none. It is one
+budget for everything together, not per transfer, it takes effect the moment you
+save it — downloads already running included — and it covers downloads only,
+never uploads.
 
-The limit is enforced inside the worker, by a small CONNECT proxy on localhost
-that the transfer is pointed at through the usual proxy variables. Both the
-Python HTTP path and the Xet client read those, so both end up going through it,
-and because CONNECT is a plain tunnel nothing is decrypted on the way: no
-certificate, no interception, no change to what arrives on disk.
+Behind it is a small CONNECT proxy on localhost, started by the app and pointed
+at through the usual proxy variables when a worker starts. Both the Python HTTP
+path and the Xet client read those, so both go through it, and because CONNECT
+is a plain tunnel nothing is decrypted on the way: no certificate, no
+interception, no change to what arrives on disk. A proxy you configured for the
+container yourself stays untouched as long as no limit is set.
+
+What is capped is the line, not the disk: Xet transfers compressed and skips
+chunks it can reconstruct from what you already have, so a repo can land faster
+than the ceiling suggests.
 
 Shaping this in the kernel with `tc` would be the better place for it, and on a
 normal Linux host it is the better answer. On a Synology it is not available:
