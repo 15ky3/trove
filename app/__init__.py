@@ -10,4 +10,4 @@ for _var in ("HF_ENDPOINT", "HF_TOKEN", "UI_PASSWORD", "HF_HOME"):
     if _var in os.environ and not os.environ[_var].strip():
         del os.environ[_var]
 
-__version__ = "1.4"
+__version__ = "1.5"

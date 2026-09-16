@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import secrets
 import time
@@ -17,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 
-from . import __version__, hub, storage
+from . import __version__, hub, storage, throttle
 from .config import (
     DATA_DIR,
     REPO_TYPES,
@@ -29,6 +30,10 @@ from .config import (
     valid_repo_id,
 )
 from .jobs import ACTIVE, manager
+
+#: The app has nothing else to say at runtime; the few lines it does have go to
+#: uvicorn's logger, so they land in the container log with everything else.
+log = logging.getLogger("uvicorn.error")
 
 STATIC_DIR = Path(__file__).parent / "static"
 COOKIE_NAME = "hfd_session"
@@ -93,10 +98,14 @@ ws_hub = EventHub()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_dirs()
+    # The speed limiter belongs to the process, not to a transfer: it is one
+    # budget for all of them, and it has to be up before the first job starts.
+    throttle.shared.apply(settings.get("max_download_mbit"), log.warning)
     manager.bind(ws_hub.broadcast)
     await manager.start()
     yield
     await manager.shutdown()
+    throttle.shared.stop()
 
 
 app = FastAPI(title="Trove", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -114,6 +123,7 @@ class SettingsBody(BaseModel):
     endpoint: str | None = None
     max_concurrent: int | None = None
     max_workers: int | None = None
+    max_download_mbit: float | None = None
     auto_clear_done: bool | None = None
 
 
@@ -218,6 +228,9 @@ async def get_settings() -> dict[str, Any]:
 async def put_settings(body: SettingsBody) -> dict[str, Any]:
     values = {k: v for k, v in body.model_dump().items() if v is not None}
     settings.update(values)
+    # Both limits take effect at once: the concurrency one on jobs that are
+    # waiting, the speed one on transfers that are already running.
+    throttle.shared.apply(settings.get("max_download_mbit"), log.warning)
     # Apply a changed concurrency limit to waiting jobs right away.
     await manager.reschedule()
     return settings.public()

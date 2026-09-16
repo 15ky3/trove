@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from . import throttle
 from .config import DEFAULT_SETTINGS, JOBS_FILE, local_dir_for, settings
 from . import storage
 
@@ -376,7 +377,11 @@ class JobManager:
             env.pop("HF_ENDPOINT", None)
         env["PYTHONUNBUFFERED"] = "1"
         env["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
-        return env
+        # A speed limit is a proxy on localhost that every worker shares, read
+        # at the moment the worker starts. Nothing is removed when no limit is
+        # set: a proxy the operator configured for the container stays the
+        # worker's proxy.
+        return throttle.shared.apply_to_env(env)
 
     async def _run(self, job: Job) -> None:
         proc: asyncio.subprocess.Process | None = None

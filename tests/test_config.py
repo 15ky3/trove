@@ -97,6 +97,31 @@ class TestSettings:
     def test_numbers_are_clamped(self, key, given, expected):
         assert config.settings.update({key: given})[key] == expected
 
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            (0, 0.0),
+            (-50, 0.0),
+            (25, 25.0),
+            (2.46, 2.5),
+            ("40", 40.0),
+            (999_999, config.MAX_DOWNLOAD_MBIT),
+        ],
+    )
+    def test_the_speed_limit_is_clamped(self, given, expected):
+        assert config.settings.update({"max_download_mbit": given})["max_download_mbit"] == expected
+
+    def test_the_speed_limit_is_off_by_default(self):
+        assert config.DEFAULT_SETTINGS["max_download_mbit"] == 0.0
+
+    @pytest.mark.parametrize("given", ["quick", float("nan"), float("inf"), float("-inf")])
+    def test_a_speed_limit_that_is_not_a_number_is_ignored(self, given):
+        # NaN used to survive the clamp as the maximum: min(10_000, nan) is
+        # 10_000, so a broken value bought a 10 Gbit/s ceiling.
+        config.settings.update({"max_download_mbit": 12})
+        config.settings.update({"max_download_mbit": given})
+        assert config.settings.get("max_download_mbit") == 12.0
+
     def test_non_numeric_is_ignored(self):
         before = config.settings.get("max_workers")
         config.settings.update({"max_workers": "many"})

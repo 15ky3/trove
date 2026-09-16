@@ -8,6 +8,7 @@ defaults: whatever is set in the web interface wins.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -45,7 +46,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "max_workers": 4,
     # Drop finished jobs from the queue list automatically.
     "auto_clear_done": False,
+    # Download speed ceiling in Mbit/s, 0 for none. Enforced by a local proxy
+    # the app runs and every worker shares (see app/throttle.py), because the
+    # kernel this ships to cannot shape a container's incoming traffic.
+    "max_download_mbit": 0.0,
 }
+
+#: Beyond this a limit stops meaning anything on the hardware this runs on.
+MAX_DOWNLOAD_MBIT = 10_000.0
 
 _REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?$")
 
@@ -105,6 +113,19 @@ class Settings:
                     continue
                 # Same bounds as the input fields in the web interface.
                 value = max(1, min(16 if key == "max_concurrent" else 32, value))
+            elif key == "max_download_mbit":
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                # json.loads accepts a bare NaN, and clamping one yields the
+                # maximum rather than nothing: min(10_000, nan) keeps 10_000
+                # because the comparison is false. Refuse it like any other
+                # value that is not a number.
+                if not math.isfinite(value):
+                    continue
+                # A negative ceiling would mean "stop entirely"; it means "off".
+                value = max(0.0, min(MAX_DOWNLOAD_MBIT, round(value, 1)))
             elif key == "auto_clear_done":
                 value = bool(value)
             else:

@@ -8,7 +8,7 @@ import signal
 
 import pytest
 
-from app import config, jobs
+from app import config, jobs, throttle
 from app.jobs import CANCELLED, DONE, ERROR, QUEUED, RUNNING, Job, manager
 from conftest import run, use_stub_worker, wait_for
 
@@ -446,6 +446,44 @@ class TestWorkerEnvironment:
         job = Job(id="a", kind="download", repo_id="org/name", dest="/data/x")
         payload = json.loads(manager._build_command(job)[-1])
         assert payload["max_workers"] == 3
+
+    def test_a_speed_limit_reaches_the_worker_as_a_proxy(self):
+        url = throttle.shared.apply(20)
+        try:
+            env = manager._build_env()
+            assert url
+            assert all(env[var] == url for var in throttle.PROXY_VARS)
+        finally:
+            throttle.shared.stop()
+
+    def test_without_a_limit_no_proxy_is_forced_on_the_worker(self):
+        throttle.shared.stop()
+        assert not any(var in manager._build_env() for var in throttle.PROXY_VARS)
+
+    def test_an_exclusion_list_cannot_walk_past_the_speed_limit(self, monkeypatch):
+        # NO_PROXY=huggingface.co would send the worker straight out while the
+        # interface still showed a ceiling.
+        monkeypatch.setenv("NO_PROXY", "huggingface.co")
+        throttle.shared.apply(20)
+        try:
+            assert "NO_PROXY" not in manager._build_env()
+        finally:
+            throttle.shared.stop()
+
+    def test_a_proxy_the_operator_set_survives(self, monkeypatch):
+        # Someone running Trove behind a company proxy keeps it; the speed
+        # limit is the only reason we ever touch these variables.
+        monkeypatch.setenv("HTTPS_PROXY", "http://company:3128")
+        throttle.shared.stop()
+        assert manager._build_env()["HTTPS_PROXY"] == "http://company:3128"
+
+    def test_a_speed_limit_wins_over_an_inherited_proxy(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://company:3128")
+        url = throttle.shared.apply(20)
+        try:
+            assert manager._build_env()["HTTPS_PROXY"] == url
+        finally:
+            throttle.shared.stop()
 
     def test_upload_payload_carries_its_own_fields(self):
         job = Job(id="a", kind="upload", repo_id="org/name", src="/data/src", private=True)
