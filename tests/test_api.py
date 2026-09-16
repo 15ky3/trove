@@ -137,6 +137,13 @@ class TestSettingsEndpoint:
     def test_out_of_range_values_are_clamped(self, client):
         assert client.put("/api/settings", json={"max_workers": 999}).json()["max_workers"] == 32
 
+    def test_the_speed_limit_round_trips(self, client):
+        assert client.put("/api/settings", json={"max_download_mbit": 30}).json()["max_download_mbit"] == 30.0
+        assert client.get("/api/settings").json()["max_download_mbit"] == 30.0
+
+    def test_a_negative_speed_limit_means_off(self, client):
+        assert client.put("/api/settings", json={"max_download_mbit": -1}).json()["max_download_mbit"] == 0.0
+
     def test_omitted_fields_are_left_alone(self, client):
         client.put("/api/settings", json={"endpoint": "https://mirror"})
         assert client.put("/api/settings", json={"max_workers": 5}).json()["endpoint"] == "https://mirror"

@@ -112,7 +112,7 @@ by hand in the container — against the same folders.
 </tr>
 <tr>
 <td><img src="docs/picker.png" alt="File picker with two GGUF quants ticked out of twenty-one files"><br><sub><b>Pick files</b> — two quants ticked: 4.34 GB instead of 40.2 GB.</sub></td>
-<td><img src="docs/settings.png" alt="Settings with token, endpoint and concurrency"><br><sub><b>Settings</b> — token, endpoint, parallel transfers, files at once.</sub></td>
+<td><img src="docs/settings.png" alt="Settings with token, endpoint and concurrency"><br><sub><b>Settings</b> — token, endpoint, parallel transfers, files at once, speed limit.</sub></td>
 </tr>
 </table>
 
@@ -294,6 +294,24 @@ If a download is killed again and again, the cause is almost always memory:
 each transfer opens `Files at once` files in parallel, and that multiplies
 with `Parallel transfers`. Two transfers with eight threads means sixteen
 downloads in flight. On a NAS, lowering either is the fix.
+
+### Capping the download speed
+
+**Speed limit** in Settings takes a ceiling in Mbit/s; `0` means none. It applies
+to transfers started after you save it — a transfer already running keeps the
+speed it began with — and it covers downloads only, never uploads.
+
+The limit is enforced inside the worker, by a small CONNECT proxy on localhost
+that the transfer is pointed at through the usual proxy variables. Both the
+Python HTTP path and the Xet client read those, so both end up going through it,
+and because CONNECT is a plain tunnel nothing is decrypted on the way: no
+certificate, no interception, no change to what arrives on disk.
+
+Shaping this in the kernel with `tc` would be the better place for it, and on a
+normal Linux host it is the better answer. On a Synology it is not available:
+the DSM kernel ships neither an ingress qdisc nor `ifb`, and without one of them
+a container's *incoming* traffic cannot be shaped at all — every queueing
+discipline that is there works on what leaves the box.
 
 ### Keeping copies current
 

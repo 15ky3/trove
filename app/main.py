@@ -114,6 +114,7 @@ class SettingsBody(BaseModel):
     endpoint: str | None = None
     max_concurrent: int | None = None
     max_workers: int | None = None
+    max_download_mbit: float | None = None
     auto_clear_done: bool | None = None
 
 

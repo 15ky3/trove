@@ -358,6 +358,9 @@ class JobManager:
                 "allow_patterns": job.allow_patterns,
                 "ignore_patterns": job.ignore_patterns,
                 "max_workers": int(settings.get("max_workers") or DEFAULT_SETTINGS["max_workers"]),
+                # Read when the job starts: changing the ceiling does not reach
+                # into a transfer that is already running.
+                "limit_mbit": float(settings.get("max_download_mbit") or 0),
             }
         return [sys.executable, "-u", "-m", "app.worker", json.dumps(payload)]
 

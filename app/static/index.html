@@ -222,6 +222,13 @@
           </div>
         </div>
         <div class="form-row">
+          <label for="set-limit">Speed limit</label>
+          <div class="form-control">
+            <input class="field field-num mono" id="set-limit" type="number" min="0" max="10000" step="1">
+            <p class="hint">Download ceiling in Mbit/s, 0 for no limit. Applies to transfers started from now on — a running one keeps the speed it began with. Uploads are never throttled.</p>
+          </div>
+        </div>
+        <div class="form-row">
           <label>Behaviour</label>
           <div class="form-control">
             <label class="check"><input type="checkbox" id="set-autoclear"> <span>Drop finished jobs from the queue automatically</span></label>

@@ -447,12 +447,26 @@ class TestWorkerEnvironment:
         payload = json.loads(manager._build_command(job)[-1])
         assert payload["max_workers"] == 3
 
+    def test_the_speed_limit_reaches_the_worker(self):
+        config.settings.update({"max_download_mbit": 25})
+        job = Job(id="a", kind="download", repo_id="org/name", dest="/data/x")
+        payload = json.loads(manager._build_command(job)[-1])
+        assert payload["limit_mbit"] == 25.0
+
+    def test_no_speed_limit_is_passed_as_zero(self):
+        config.settings.update({"max_download_mbit": 0})
+        job = Job(id="a", kind="download", repo_id="org/name", dest="/data/x")
+        payload = json.loads(manager._build_command(job)[-1])
+        assert payload["limit_mbit"] == 0
+
     def test_upload_payload_carries_its_own_fields(self):
         job = Job(id="a", kind="upload", repo_id="org/name", src="/data/src", private=True)
         payload = json.loads(manager._build_command(job)[-1])
         assert payload["kind"] == "upload"
         assert payload["src"] == "/data/src"
         assert payload["private"] is True
+        # Uploads are deliberately not throttled.
+        assert "limit_mbit" not in payload
 
 
 class TestStats:

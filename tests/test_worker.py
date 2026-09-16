@@ -289,3 +289,69 @@ class TestEntryPoint:
         monkeypatch.setattr(worker, "run_download", stop)
         assert worker.main(["app.worker", json.dumps({"kind": "download"})]) == 143
         assert emitted(capsys)[-1]["msg"] == "Cancelled."
+
+
+class TestSpeedLimitWiring:
+    """The worker starts the limiter before the transfer and stops it after."""
+
+    class FakeLimiter:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    def arm(self, monkeypatch):
+        seen: dict = {}
+        limiter = self.FakeLimiter()
+
+        def fake_start(value, log=None):
+            seen["value"] = value
+            seen["log"] = log
+            return limiter
+
+        monkeypatch.setattr(worker.throttle, "start_limit", fake_start)
+        return seen, limiter
+
+    def test_the_limit_from_the_payload_is_applied_and_released(self, monkeypatch):
+        seen, limiter = self.arm(monkeypatch)
+        monkeypatch.setattr(worker, "run_download", lambda payload: None)
+
+        assert worker.main(["app.worker", json.dumps({"kind": "download", "limit_mbit": 25})]) == 0
+        assert seen["value"] == 25
+        assert seen["log"] is worker.log
+        assert limiter.stopped
+
+    def test_a_payload_without_a_limit_asks_for_none(self, monkeypatch):
+        seen, _ = self.arm(monkeypatch)
+        monkeypatch.setattr(worker, "run_upload", lambda payload: None)
+
+        assert worker.main(["app.worker", json.dumps({"kind": "upload"})]) == 0
+        assert seen["value"] is None
+
+    def test_the_limiter_is_released_when_the_transfer_fails(self, monkeypatch, capsys):
+        _, limiter = self.arm(monkeypatch)
+
+        def boom(_payload):
+            raise RuntimeError("nope")
+
+        monkeypatch.setattr(worker, "run_download", boom)
+        assert worker.main(["app.worker", json.dumps({"kind": "download", "limit_mbit": 5})]) == 1
+        assert limiter.stopped
+        capsys.readouterr()
+
+    def test_the_limiter_is_released_on_cancellation(self, monkeypatch, capsys):
+        _, limiter = self.arm(monkeypatch)
+
+        def stop(_payload):
+            raise SystemExit(143)
+
+        monkeypatch.setattr(worker, "run_download", stop)
+        assert worker.main(["app.worker", json.dumps({"kind": "download", "limit_mbit": 5})]) == 143
+        assert limiter.stopped
+        capsys.readouterr()
+
+    def test_without_a_limiter_nothing_is_stopped(self, monkeypatch):
+        monkeypatch.setattr(worker.throttle, "start_limit", lambda value, log=None: None)
+        monkeypatch.setattr(worker, "run_download", lambda payload: None)
+        assert worker.main(["app.worker", json.dumps({"kind": "download"})]) == 0

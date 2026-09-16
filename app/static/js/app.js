@@ -218,6 +218,7 @@
     $("#set-endpoint").value = s.endpoint || "";
     $("#set-concurrent").value = s.max_concurrent;
     $("#set-workers").value = s.max_workers;
+    $("#set-limit").value = s.max_download_mbit ?? 0;
     $("#set-autoclear").checked = !!s.auto_clear_done;
     $("#set-token").placeholder = s.token_set ? `stored (${s.token_hint})` : "hf_…";
     $("#set-token-state").textContent = s.token_set
@@ -1231,6 +1232,7 @@
       endpoint: $("#set-endpoint").value.trim(),
       max_concurrent: Number($("#set-concurrent").value),
       max_workers: Number($("#set-workers").value),
+      max_download_mbit: Number($("#set-limit").value),
       auto_clear_done: $("#set-autoclear").checked,
     };
     const token = $("#set-token").value.trim();
