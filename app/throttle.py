@@ -27,10 +27,12 @@ is not available. Userspace it is.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 #: Mbit/s as networks mean it: 10^6 bits, not 2^20.
 BYTES_PER_MBIT = 1_000_000 / 8
@@ -160,12 +162,22 @@ class ThrottledProxy:
     only if someone asks for it.
     """
 
-    def __init__(self, rate: float, host: str = "127.0.0.1") -> None:
+    def __init__(
+        self,
+        rate: float,
+        host: str = "127.0.0.1",
+        upstream_proxy: str = "",
+    ) -> None:
         #: None means everything goes through untouched. A proxy without a
         #: ceiling still has to exist: workers pointed at it keep using it for
         #: their whole life, and pulling it away mid-transfer kills them.
         self.bucket: TokenBucket | None = TokenBucket(rate)
         self.host = host
+        #: A proxy the operator configured for the container. In a network with
+        #: no direct way out, dialling the Hub ourselves would turn every
+        #: download into a 502 as soon as a limit is set, so we go through
+        #: theirs and meter what comes back.
+        self.upstream_proxy = upstream_proxy
         self.url = ""
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -287,9 +299,9 @@ class ThrottledProxy:
         host, port = target
         try:
             up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), CONNECT_TIMEOUT
+                self._open_upstream(host, port), CONNECT_TIMEOUT
             )
-        except (OSError, ConnectionError, asyncio.TimeoutError):
+        except (OSError, ConnectionError, asyncio.TimeoutError, asyncio.IncompleteReadError):
             await _reply(writer, 502, f"Cannot reach {host}:{port}")
             return
 
@@ -308,6 +320,29 @@ class ThrottledProxy:
         )
         _close(writer)
         _close(up_writer)
+
+    async def _open_upstream(
+        self, host: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Reach the target, through the operator's proxy when there is one."""
+        if not self.upstream_proxy:
+            return await asyncio.open_connection(host, port)
+
+        parts = urlsplit(self.upstream_proxy)
+        reader, writer = await asyncio.open_connection(parts.hostname, parts.port or 8080)
+        request = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        if parts.username:
+            secret = f"{parts.username}:{parts.password or ''}".encode()
+            request += f"Proxy-Authorization: Basic {base64.b64encode(secret).decode()}\r\n"
+        writer.write((request + "\r\n").encode("latin-1"))
+        await writer.drain()
+
+        head = await reader.readuntil(b"\r\n\r\n")
+        status = head.split(b"\r\n", 1)[0].split()
+        if len(status) < 2 or not status[1].startswith(b"2"):
+            _close(writer)
+            raise ConnectionError(f"upstream proxy refused: {head.splitlines()[0].decode('latin-1')}")
+        return reader, writer
 
     async def _relay(
         self,
@@ -379,6 +414,20 @@ def _connect_target(head: bytes) -> tuple[str, int] | None:
     return host.strip("[]"), number
 
 
+def inherited_proxy(env: dict[str, str] | None = None) -> str:
+    """The proxy this container was configured with, if any.
+
+    Read from the app's own environment, which the limiter never writes to —
+    only the workers' copies are rewritten, and only while a limit is on.
+    """
+    source = os.environ if env is None else env
+    for var in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        value = (source.get(var) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 class SharedLimit:
     """The one limiter every transfer of this instance goes through.
 
@@ -436,7 +485,9 @@ class SharedLimit:
                 self._limited = True
                 return self._proxy.url
 
-            proxy = ThrottledProxy(rate * BYTES_PER_MBIT)
+            proxy = ThrottledProxy(
+                rate * BYTES_PER_MBIT, upstream_proxy=inherited_proxy()
+            )
             try:
                 url = proxy.start()
             except Exception as exc:  # noqa: BLE001 - never fatal

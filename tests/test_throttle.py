@@ -351,6 +351,127 @@ class TestBudgetAccounting:
         assert elapsed < 0.4, f"a burst-sized transfer waited {elapsed:.2f}s"
 
 
+def company_proxy(seen: list[tuple[str, str]]):
+    """A stand-in for the proxy an operator configured for the container.
+
+    Speaks just enough CONNECT to record what was asked for and then acts as
+    the endpoint itself, echoing whatever comes through.
+    """
+
+    def handler(conn: socket.socket) -> None:
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(1)
+            if not chunk:
+                return
+            head += chunk
+        lines = head.decode("latin-1").split("\r\n")
+        auth = next((line for line in lines if line.lower().startswith("proxy-authorization:")), "")
+        seen.append((lines[0], auth))
+        if "deny" in lines[0]:
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            return
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        echo(conn)
+
+    return handler
+
+
+class TestUpstreamProxy:
+    """A container with no direct way out still has to work."""
+
+    def test_the_operators_proxy_is_used_instead_of_dialling_out(self, upstream):
+        seen: list[tuple[str, str]] = []
+        company = upstream(company_proxy(seen))
+        instance = throttle.ThrottledProxy(
+            50_000_000, upstream_proxy=f"http://{company.host}:{company.port}"
+        )
+        instance.start()
+        try:
+            sock, head = tunnel(instance.url, "huggingface.co", 443)
+            assert head.startswith("HTTP/1.1 200 ")
+            sock.sendall(b"through")
+            assert sock.recv(7) == b"through"
+            sock.close()
+        finally:
+            instance.stop()
+
+        assert seen[0][0] == "CONNECT huggingface.co:443 HTTP/1.1"
+
+    def test_credentials_in_the_proxy_url_are_passed_on(self, upstream):
+        seen: list[tuple[str, str]] = []
+        company = upstream(company_proxy(seen))
+        instance = throttle.ThrottledProxy(
+            50_000_000, upstream_proxy=f"http://user:secret@{company.host}:{company.port}"
+        )
+        instance.start()
+        try:
+            sock, _ = tunnel(instance.url, "huggingface.co", 443)
+            sock.close()
+        finally:
+            instance.stop()
+
+        assert seen[0][1] == "Proxy-Authorization: Basic dXNlcjpzZWNyZXQ="
+
+    def test_a_refusal_upstream_is_reported_as_502(self, upstream):
+        seen: list[tuple[str, str]] = []
+        company = upstream(company_proxy(seen))
+        instance = throttle.ThrottledProxy(
+            50_000_000, upstream_proxy=f"http://{company.host}:{company.port}"
+        )
+        instance.start()
+        try:
+            sock, head = tunnel(instance.url, "deny.example", 443)
+            assert "502" in head
+            sock.close()
+        finally:
+            instance.stop()
+
+    def test_traffic_through_the_chain_is_still_metered(self, upstream):
+        seen: list[tuple[str, str]] = []
+        company = upstream(company_proxy(seen))
+        instance = throttle.ThrottledProxy(
+            200_000, upstream_proxy=f"http://{company.host}:{company.port}"
+        )
+        instance.start()
+        try:
+            sock, _ = tunnel(instance.url, "huggingface.co", 443)
+            payload = b"m" * (throttle.MIN_BURST + 200_000)
+            sock.sendall(payload)
+            started = time.monotonic()
+            received = b""
+            while len(received) < len(payload):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                received += chunk
+            elapsed = time.monotonic() - started
+            sock.close()
+        finally:
+            instance.stop()
+
+        assert len(received) == len(payload)
+        assert elapsed >= 0.6, f"{len(payload)} bytes came back in {elapsed:.2f}s"
+
+
+class TestInheritedProxy:
+    @pytest.mark.parametrize("var", ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])
+    def test_every_spelling_is_read(self, var):
+        assert throttle.inherited_proxy({var: "http://company:3128"}) == "http://company:3128"
+
+    def test_nothing_configured_means_a_direct_connection(self):
+        assert throttle.inherited_proxy({}) == ""
+
+    def test_an_empty_value_does_not_count(self):
+        # docker compose hands unset variables through as empty strings.
+        assert throttle.inherited_proxy({"HTTPS_PROXY": "  "}) == ""
+
+    def test_the_limiter_picks_it_up_when_it_starts(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://company:3128")
+        throttle.shared.apply(10)
+        assert throttle.shared._proxy.upstream_proxy == "http://company:3128"
+
+
 class TestRefusals:
     def test_only_connect_is_served(self, proxy):
         instance = proxy(1_000_000)
