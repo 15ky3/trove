@@ -54,6 +54,9 @@ CONNECT_TIMEOUT = 20.0
 #: larger is not a client we serve.
 HEADER_LIMIT = 32 * 1024
 
+#: How long to wait for the proxy thread to report a bound port.
+START_TIMEOUT = 10.0
+
 #: Every spelling a client might read. httpx and reqwest both look at the
 #: uppercase and the lowercase form.
 PROXY_VARS = (
@@ -163,6 +166,9 @@ class ThrottledProxy:
         self._stopped: asyncio.Event | None = None
         self._ready = threading.Event()
         self._error: BaseException | None = None
+        self._abandoned = False
+        #: Tunnels currently being served, so stop() can end them.
+        self._clients: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -170,7 +176,12 @@ class ThrottledProxy:
         """Bring the proxy up and return its URL. Raises if it cannot bind."""
         self._thread = threading.Thread(target=self._serve, name="throttle", daemon=True)
         self._thread.start()
-        if not self._ready.wait(10):
+        if not self._ready.wait(START_TIMEOUT):
+            # Whatever it is doing, nobody will ever use it. Say so, so that a
+            # thread which binds a moment later takes itself down again instead
+            # of holding a port for the life of the process.
+            self._abandoned = True
+            self.stop()
             raise RuntimeError("the speed limiter did not start in time")
         if self._error is not None:
             raise self._error
@@ -181,9 +192,14 @@ class ThrottledProxy:
         stopped = self._stopped
         if loop is not None and stopped is not None and not loop.is_closed():
             loop.call_soon_threadsafe(stopped.set)
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5)
+            # Only let go of a thread that actually ended. Dropping the handle
+            # of one that did not is how a proxy becomes unreachable and
+            # unstoppable while still holding its port.
+            if not thread.is_alive():
+                self._thread = None
 
     def _serve(self) -> None:
         try:
@@ -201,12 +217,37 @@ class ThrottledProxy:
         )
         self.url = f"http://{self.host}:{server.sockets[0].getsockname()[1]}"
         self._ready.set()
-        async with server:
+        if self._abandoned:
+            self._stopped.set()
+        try:
             await self._stopped.wait()
+        finally:
+            server.close()
+            # Open tunnels have to be ended by hand. Waiting for the server to
+            # close waits for its handlers too (3.12.1 and newer), so a caller
+            # in stop() would sit here for as long as a transfer runs — and
+            # stop() is called from the request that clears the setting, which
+            # means the whole ASGI loop would sit here with it.
+            for task in list(self._clients):
+                task.cancel()
+            if self._clients:
+                await asyncio.wait(self._clients, timeout=2)
+            await server.wait_closed()
 
     # --------------------------------------------------------------- serving
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._clients.add(task)
+        try:
+            await self._tunnel(reader, writer)
+        except asyncio.CancelledError:
+            _close(writer)
+        finally:
+            self._clients.discard(task)
+
+    async def _tunnel(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), CONNECT_TIMEOUT)
         except asyncio.LimitOverrunError:

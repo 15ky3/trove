@@ -421,6 +421,66 @@ class TestLifecycle:
     def test_stop_is_safe_before_a_start(self):
         throttle.ThrottledProxy(1_000_000).stop()
 
+    def test_stop_ends_open_tunnels_instead_of_waiting_for_them(self, upstream):
+        # Closing the server waits for its handlers (3.12.1+), so an open
+        # tunnel used to hold stop() for the full join timeout and leave the
+        # thread behind — while blocking the ASGI loop it was called from.
+        server = upstream(lambda conn: time.sleep(30))
+        instance = throttle.ThrottledProxy(1_000_000)
+        instance.start()
+        sock, head = tunnel(instance.url, server.host, server.port)
+        assert head.startswith("HTTP/1.1 200 ")
+
+        started = time.monotonic()
+        instance.stop()
+        elapsed = time.monotonic() - started
+        sock.close()
+
+        assert elapsed < 2, f"stop() took {elapsed:.2f}s with a tunnel open"
+        assert not [t for t in threading.enumerate() if t.name == "throttle"]
+
+    def test_a_proxy_that_never_comes_up_is_given_up_on(self, monkeypatch):
+        async def never(*args, **kwargs):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(throttle, "START_TIMEOUT", 0.2)
+        monkeypatch.setattr(throttle.asyncio, "start_server", never)
+        instance = throttle.ThrottledProxy(1_000_000)
+        with pytest.raises(RuntimeError):
+            instance.start()
+
+    def test_a_port_bound_too_late_is_released_again(self, monkeypatch):
+        # The thread that missed its deadline must not keep serving on a port
+        # nothing points at.
+        real = throttle.asyncio.start_server
+        slow_url: list[str] = []
+
+        async def slow(*args, **kwargs):
+            await asyncio.sleep(0.4)
+            server = await real(*args, **kwargs)
+            slow_url.append(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+            return server
+
+        monkeypatch.setattr(throttle, "START_TIMEOUT", 0.1)
+        monkeypatch.setattr(throttle.asyncio, "start_server", slow)
+        instance = throttle.ThrottledProxy(1_000_000)
+        with pytest.raises(RuntimeError):
+            instance.start()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not slow_url:
+            time.sleep(0.05)
+        assert slow_url, "the late thread never bound at all"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                talk(slow_url[0]).close()
+            except OSError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the abandoned proxy kept its port")
+
 
 # -------------------------------------------------------- The shared limiter
 
