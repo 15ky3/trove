@@ -158,7 +158,10 @@ class ThrottledProxy:
     """
 
     def __init__(self, rate: float, host: str = "127.0.0.1") -> None:
-        self.bucket = TokenBucket(rate)
+        #: None means everything goes through untouched. A proxy without a
+        #: ceiling still has to exist: workers pointed at it keep using it for
+        #: their whole life, and pulling it away mid-transfer kills them.
+        self.bucket: TokenBucket | None = TokenBucket(rate)
         self.host = host
         self.url = ""
         self._thread: threading.Thread | None = None
@@ -169,6 +172,19 @@ class ThrottledProxy:
         self._abandoned = False
         #: Tunnels currently being served, so stop() can end them.
         self._clients: set[asyncio.Task] = set()
+
+    def set_rate(self, rate: float | None) -> None:
+        """Retune, or let everything through when given None.
+
+        Open tunnels read the bucket on every chunk, so a change reaches the
+        transfers that are running, not just the next ones.
+        """
+        if rate is None:
+            self.bucket = None
+        elif self.bucket is None:
+            self.bucket = TokenBucket(rate)
+        else:
+            self.bucket.set_rate(rate)
 
     # ------------------------------------------------------------- lifecycle
 
@@ -283,8 +299,8 @@ class ThrottledProxy:
             return
 
         await asyncio.gather(
-            self._relay(up_reader, writer, self.bucket),
-            self._relay(reader, up_writer, None),
+            self._relay(up_reader, writer, throttled=True),
+            self._relay(reader, up_writer, throttled=False),
             return_exceptions=True,
         )
         _close(writer)
@@ -294,7 +310,7 @@ class ThrottledProxy:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-        bucket: TokenBucket | None,
+        throttled: bool,
     ) -> None:
         """Move bytes one way, paying for them before they are handed on.
 
@@ -312,6 +328,9 @@ class ThrottledProxy:
                 data = await reader.read(CHUNK)
                 if not data:
                     break
+                # Read afresh every time: the ceiling can change, or go away,
+                # while this tunnel is open.
+                bucket = self.bucket if throttled else None
                 if bucket is not None:
                     await _pay(bucket, len(data))
                 writer.write(data)
@@ -368,12 +387,21 @@ class SharedLimit:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._proxy: ThrottledProxy | None = None
-        self.mbit = 0.0
+        self._limited = False
 
     @property
     def url(self) -> str:
+        """Where a worker starting now should send its traffic, if anywhere."""
         proxy = self._proxy
-        return proxy.url if proxy is not None else ""
+        return proxy.url if proxy is not None and self._limited else ""
+
+    @property
+    def mbit(self) -> float:
+        """The ceiling in force, read from the bucket rather than kept twice."""
+        proxy = self._proxy
+        if proxy is None or proxy.bucket is None:
+            return 0.0
+        return proxy.bucket.rate / BYTES_PER_MBIT
 
     def apply(self, mbit: Any, log: Callable[..., None] | None = None) -> str:
         """Set the ceiling in Mbit/s. Zero — or nonsense — turns it off.
@@ -390,12 +418,19 @@ class SharedLimit:
 
         with self._lock:
             if rate <= 0:
-                self._shutdown()
+                # The proxy stays up. Workers that started while the limit was
+                # on carry its address for their whole life, and closing the
+                # port under them ends their transfer with a refused
+                # connection. It lets everything through from here instead, and
+                # workers starting from now on are sent out directly.
+                if self._proxy is not None:
+                    self._proxy.set_rate(None)
+                self._limited = False
                 return ""
 
             if self._proxy is not None:
-                self._proxy.bucket.set_rate(rate * BYTES_PER_MBIT)
-                self.mbit = rate
+                self._proxy.set_rate(rate * BYTES_PER_MBIT)
+                self._limited = True
                 return self._proxy.url
 
             proxy = ThrottledProxy(rate * BYTES_PER_MBIT)
@@ -406,7 +441,7 @@ class SharedLimit:
                     log(f"Speed limit of {rate:g} Mbit/s not applied: {exc}")
                 return ""
             self._proxy = proxy
-            self.mbit = rate
+            self._limited = True
             return url
 
     def env(self) -> dict[str, str]:
@@ -422,11 +457,12 @@ class SharedLimit:
             self._shutdown()
 
     def _shutdown(self) -> None:
-        """Caller holds the lock."""
+        """Caller holds the lock. Only for shutting the app down: while it
+        runs, a limit that is switched off keeps its proxy."""
         if self._proxy is not None:
             self._proxy.stop()
             self._proxy = None
-        self.mbit = 0.0
+        self._limited = False
 
 
 #: The instance everything else talks to.

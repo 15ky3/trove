@@ -525,17 +525,60 @@ class TestSharedLimit:
         assert throttle.shared._proxy.bucket.rate == pytest.approx(50 * throttle.BYTES_PER_MBIT)
         assert throttle.shared.mbit == 50
 
-    def test_setting_it_to_zero_takes_the_proxy_down(self):
-        url = throttle.shared.apply(10)
+    def test_setting_it_to_zero_sends_new_workers_out_directly(self):
+        throttle.shared.apply(10)
         assert throttle.shared.apply(0) == ""
         assert throttle.shared.env() == {}
-        with pytest.raises(OSError):
-            talk(url).close()
+        assert throttle.shared.mbit == 0.0
 
-    def test_switching_it_back_on_binds_again(self):
+    def test_setting_it_to_zero_leaves_running_transfers_alone(self, upstream):
+        # A worker started while the limit was on keeps the proxy address for
+        # its whole life. Closing the port under it used to end its transfer
+        # with a refused connection — the opposite of "no limit".
+        throttle.shared.apply(10)
+        port = throttle.shared.url
+        server = upstream(echo)
+
+        sock, head = tunnel(port, server.host, server.port)
+        assert head.startswith("HTTP/1.1 200 ")
+        throttle.shared.apply(0)
+
+        sock.sendall(b"still there")
+        assert sock.recv(11) == b"still there"
+        sock.close()
+        # And a worker starting now can still reach it, it simply is not told to.
+        again, head = tunnel(port, server.host, server.port)
+        assert head.startswith("HTTP/1.1 200 ")
+        again.close()
+
+    def test_clearing_the_limit_unthrottles_what_is_already_open(self, upstream):
+        throttle.shared.apply(0.4)  # 50_000 B/s — 65 KiB would take over a second
+        payload = b"c" * (throttle.MIN_BURST * 4)
+        server = upstream(blast(payload))
+
+        sock, _ = tunnel(throttle.shared.url, server.host, server.port)
+        sock.recv(1)
+        throttle.shared.apply(0)
+        started = time.monotonic()
+        rest = read_all(sock)
+        elapsed = time.monotonic() - started
+        sock.close()
+
+        assert len(rest) == len(payload) - 1
+        assert elapsed < 2, f"the rest of the transfer still took {elapsed:.2f}s"
+
+    def test_switching_it_back_on_reuses_the_same_proxy(self):
+        first = throttle.shared.apply(10)
+        throttle.shared.apply(0)
+        assert throttle.shared.apply(10) == first
+
+    def test_switching_it_back_on_throttles_what_is_already_open(self):
         throttle.shared.apply(10)
         throttle.shared.apply(0)
-        assert throttle.shared.apply(10).startswith("http://127.0.0.1:")
+        assert throttle.shared._proxy.bucket is None
+        throttle.shared.apply(5)
+        # The same tunnels are paying again, at the new rate.
+        assert throttle.shared._proxy.bucket.rate == pytest.approx(5 * throttle.BYTES_PER_MBIT)
 
     def test_the_budget_is_shared_by_everything_going_through_it(self, upstream):
         # The point of one limiter for the whole app: two transfers together

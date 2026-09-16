@@ -176,10 +176,14 @@ class TestSettingsEndpoint:
         finally:
             throttle.shared.stop()
 
-    def test_clearing_the_limit_takes_the_limiter_down(self, client):
-        client.put("/api/settings", json={"max_download_mbit": 16})
-        client.put("/api/settings", json={"max_download_mbit": 0})
-        assert throttle.shared.url == ""
+    def test_clearing_the_limit_stops_pointing_workers_at_it(self, client):
+        try:
+            client.put("/api/settings", json={"max_download_mbit": 16})
+            client.put("/api/settings", json={"max_download_mbit": 0})
+            assert throttle.shared.url == ""
+            assert throttle.shared.mbit == 0.0
+        finally:
+            throttle.shared.stop()
 
     def test_omitted_fields_are_left_alone(self, client):
         client.put("/api/settings", json={"endpoint": "https://mirror"})
