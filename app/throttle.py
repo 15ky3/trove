@@ -466,7 +466,6 @@ class SharedLimit:
             rate = float(mbit or 0)
         except (TypeError, ValueError):
             rate = 0.0
-        rate = max(0.0, rate)
 
         with self._lock:
             if rate <= 0:

@@ -289,4 +289,3 @@ class TestEntryPoint:
         monkeypatch.setattr(worker, "run_download", stop)
         assert worker.main(["app.worker", json.dumps({"kind": "download"})]) == 143
         assert emitted(capsys)[-1]["msg"] == "Cancelled."
-
